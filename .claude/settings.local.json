@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(netstat -ano)",
+      "Bash(taskkill //F //PID 14064)",
+      "Bash(export PATH=\"$PATH:$LOCALAPPDATA/Android/Sdk/platform-tools\")",
+      "Bash(adb devices:*)",
+      "Bash(adb pair:*)",
+      "Bash(taskkill //F //PID 23788)",
+      "Bash(ipconfig)",
+      "Bash(export ANDROID_HOME=\"C:/Users/Lenovo/AppData/Local/Android/Sdk\")",
+      "Bash(./gradlew.bat assembleRelease)",
+      "Bash(echo 'sdk.dir=C\\\\:\\\\\\\\Users\\\\\\\\Lenovo\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Android\\\\\\\\Sdk')",
+      "Bash(where.exe node:*)",
+      "Bash(node -e \"console.log\\(require.resolve\\(''react-native/package.json''\\)\\)\")",
+      "Bash(ls -d c:/Users/Lenovo/Desktop/SachinDeepHorizon/location_service/*/)"
+    ]
+  }
+}

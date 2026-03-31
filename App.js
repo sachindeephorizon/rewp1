@@ -46,17 +46,14 @@ const getDistance = (a, b) => {
 
 // ═══════════════════════════════════════════════════════════
 //  2D KALMAN FILTER (with velocity prediction)
-//  Matches backend gps.js — predicts next position using
-//  constant-velocity model, then corrects with GPS measurement.
-//  R adapts to GPS accuracy: noisier fix → trust prediction more.
 // ═══════════════════════════════════════════════════════════
 class KalmanFilter2D {
   constructor() {
-    this.x = null;        // estimated position [lat, lng]
-    this.v = [0, 0];      // estimated velocity [dlat/s, dlng/s]
-    this.P = 1;           // error covariance
-    this.Q = 0.00001;     // process noise (how much we expect movement to vary)
-    this.R = 0.0001;      // base measurement noise
+    this.x = null;
+    this.v = [0, 0];
+    this.P = 1;
+    this.Q = 0.00001;
+    this.R = 0.0001;
   }
 
   update(measurement, dt, accuracy) {
@@ -65,27 +62,21 @@ class KalmanFilter2D {
       return this.x;
     }
 
-    // ── PREDICT: constant-velocity model ──
     const predicted = [
       this.x[0] + this.v[0] * dt,
       this.x[1] + this.v[1] * dt,
     ];
     const predictedP = this.P + this.Q;
 
-    // ── Adaptive R: scale measurement noise by GPS accuracy ──
-    // accuracy=5m → trust GPS more (low R), accuracy=30m → trust prediction more (high R)
     const adaptiveR = this.R * Math.max(1, accuracy / 5);
 
-    // ── UPDATE: Kalman gain ──
     const K = predictedP / (predictedP + adaptiveR);
 
-    // Correct position with measurement
     this.x = [
       predicted[0] + K * (measurement[0] - predicted[0]),
       predicted[1] + K * (measurement[1] - predicted[1]),
     ];
 
-    // Update velocity estimate
     if (dt > 0) {
       this.v = [
         (this.x[0] - predicted[0] + this.v[0] * dt) / dt,
@@ -93,7 +84,6 @@ class KalmanFilter2D {
       ];
     }
 
-    // Update error covariance
     this.P = (1 - K) * predictedP;
 
     return this.x;
@@ -108,20 +98,13 @@ class KalmanFilter2D {
 
 // ═══════════════════════════════════════════════════════════
 //  CORE GPS PROCESSOR — shared by foreground & background
-//  Identical logic in both paths. Never sends raw GPS.
-//  Uses Kalman filter instead of simple weighted average.
 // ═══════════════════════════════════════════════════════════
 const processLocation = (loc, prev, kalman) => {
   const { latitude, longitude, accuracy } = loc.coords;
-  const ts = loc.timestamp; // GPS timestamp — NOT Date.now()
+  const ts = loc.timestamp;
 
-  // REJECT: bad accuracy (>30m)
   if (!accuracy || accuracy > GPS.MAX_ACCURACY) return null;
-
-  // REJECT: invalid coordinates
   if (!latitude || !longitude) return null;
-
-  // REJECT: no valid GPS timestamp
   if (!ts || ts <= 0) return null;
 
   const point = { latitude, longitude };
@@ -129,24 +112,18 @@ const processLocation = (loc, prev, kalman) => {
   if (prev) {
     const timeDiff = ts - prev.timestamp;
 
-    // REJECT: zero / too-small time gap
     if (!timeDiff || timeDiff < GPS.MIN_TIME_MS) return null;
 
-    const dt = timeDiff / 1000; // seconds
+    const dt = timeDiff / 1000;
     const distance = getDistance(prev, point);
 
-    // REJECT: unrealistic GPS jump (>100m)
     if (distance > GPS.MAX_JUMP) return null;
 
-    // CALCULATE speed from distance/time — never use coords.speed
     const rawSpeed = distance / dt;
 
-    // REJECT: teleport speed (>50 m/s)
     if (rawSpeed > GPS.MAX_SPEED) return null;
 
-    // STATIONARY: drift < 3m → clamp position, zero speed
     if (distance < GPS.MIN_MOVEMENT) {
-      // Feed stationary position to Kalman so it converges, but don't move output
       kalman.update([prev.latitude, prev.longitude], dt, accuracy);
       return {
         latitude: prev.latitude,
@@ -159,10 +136,8 @@ const processLocation = (loc, prev, kalman) => {
       };
     }
 
-    // Apply Kalman filter (replaces simple weighted average)
     const filtered = kalman.update([latitude, longitude], dt, accuracy);
 
-    // Speed from Kalman-filtered position for consistency
     const filteredDist = getDistance(prev, { latitude: filtered[0], longitude: filtered[1] });
     const speed = filteredDist / dt;
 
@@ -177,7 +152,6 @@ const processLocation = (loc, prev, kalman) => {
     };
   }
 
-  // First reading — initialize Kalman
   kalman.update([latitude, longitude], 1, accuracy);
 
   return {
@@ -192,11 +166,13 @@ const processLocation = (loc, prev, kalman) => {
 };
 
 // ───────── BACKGROUND STATE (global — TaskManager runs outside React) ─────────
+// FIX: bgPrev and bgKalman are ONLY touched by the background task.
+//      The foreground watcher must NOT overwrite these.
 let bgPrev = null;
 const bgKalman = new KalmanFilter2D();
 
 // ═══════════════════════════════════════════════════════════
-//  BACKGROUND TASK — same processing logic as foreground
+//  BACKGROUND TASK
 // ═══════════════════════════════════════════════════════════
 TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
   if (error || !data) return;
@@ -208,7 +184,7 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
     const result = processLocation(loc, bgPrev, bgKalman);
     if (!result) return;
 
-    // Update background previous-location
+    // Background manages its own prev — foreground never touches this
     bgPrev = { latitude: result.latitude, longitude: result.longitude, timestamp: result.timestamp };
 
     await fetch(`${BACKEND_URL}/${userId}/ping`, {
@@ -259,14 +235,13 @@ function LoginScreen({ onLogin }) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  TRACKING SCREEN — no map, just Track Me + stats
+//  TRACKING SCREEN
 // ═══════════════════════════════════════════════════════════
 function TrackingScreen({ userId, onLogout }) {
   const [location, setLocation] = useState(null);
   const [isTracking, setIsTracking] = useState(false);
   const [speed, setSpeed] = useState(0);
   const [gpsAcc, setGpsAcc] = useState(null);
-
   const [totalDist, setTotalDist] = useState(0);
   const [serverStatus, setServerStatus] = useState('--');
 
@@ -276,8 +251,7 @@ function TrackingScreen({ userId, onLogout }) {
   const kalmanRef = useRef(new KalmanFilter2D());
   const mapRef = useRef(null);
 
-
-  // ── Mini map HTML (Leaflet + OSM, blue dot, no extra lib) ──
+  // ── Mini map HTML ──
   const buildMapHTML = (lat, lng) => `
 <!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -293,12 +267,11 @@ document.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(
 window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.t==='loc'){mk.setLatLng([d.a,d.o]);map.setView([d.a,d.o],map.getZoom(),{animate:true,duration:0.5})}}catch(x){}});
 <\/script></body></html>`;
 
-  // Push location update to mini map
   const updateMap = (lat, lng) => {
     mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));
   };
 
-  // ── Send filtered data to backend ──
+  // ── Send to backend ──
   const sendToBackend = async (r) => {
     try {
       const res = await fetch(`${BACKEND_URL}/${userId}/ping`, {
@@ -332,50 +305,51 @@ window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.
     setTotalDist(0);
     setServerStatus('--');
 
-    // Reset Kalman filters + prev for fresh session
+    // FIX: Only reset foreground state here.
+    // bgKalman and bgPrev are managed exclusively by the background task.
     kalmanRef.current.reset();
-    bgKalman.reset();
     prevRef.current = null;
-    bgPrev = null;
 
+    // FIX: timeInterval changed from 10000 → 1000 (1 second)
+    // This prevents the OS from throttling/killing the subscription after ~1km
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 10000,
+        timeInterval: 5000,      // ← was 10000 (10s) — caused stop after ~1km
         distanceInterval: 0,
       },
       (loc) => {
-        // Process BEFORE setting state
         const r = processLocation(loc, prevRef.current, kalmanRef.current);
         if (!r) return;
 
-        // Store previous in ref
+        // FIX: Only update foreground prev — do NOT touch bgPrev here.
+        // Overwriting bgPrev from foreground caused background task to get
+        // wrong time/distance deltas → processLocation returned null → no updates.
         prevRef.current = { latitude: r.latitude, longitude: r.longitude, timestamp: r.timestamp };
-        bgPrev = { ...prevRef.current };
 
-        // Update UI state with filtered data only
         setLocation({ latitude: r.latitude, longitude: r.longitude });
         updateMap(r.latitude, r.longitude);
         setSpeed(r.speed);
         setGpsAcc(r.accuracy);
-
 
         if (r.moving && r.distance > 0) {
           distRef.current += r.distance;
           setTotalDist(distRef.current);
         }
 
-        // Send every valid processed location to backend
         sendToBackend(r);
       }
     );
     subRef.current = sub;
 
-    // Background — same accuracy
+    // FIX: Background timeInterval changed from 10000 → 5000 (5 seconds)
+    // Matches foreground frequency better, prevents OS from considering
+    // the location task as idle and killing it.
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
-      timeInterval: 10000,
-      distanceInterval: 5,
+      timeInterval: 10000,      // ← was 10000 (10s)
+      distanceInterval: 10,
+      showsBackgroundLocationIndicator: true,
       foregroundService: {
         notificationTitle: 'Live Tracking Active',
         notificationBody: `Tracking ${userId}`,
@@ -394,7 +368,6 @@ window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.
       subRef.current = null;
     }
 
-    // Call /:id/stop to flush session from Redis → PostgreSQL
     try {
       await fetch(`${BACKEND_URL}/${userId}/stop`, {
         method: 'POST',
@@ -402,10 +375,13 @@ window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.
       });
     } catch {}
 
-
     const running = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK);
     if (running) await Location.stopLocationUpdatesAsync(BACKGROUND_TASK);
     await SecureStore.deleteItemAsync(STORAGE_KEY);
+
+    // Reset background state when explicitly stopped
+    bgPrev = null;
+    bgKalman.reset();
   };
 
   // ── INITIAL LOCATION ──
@@ -415,7 +391,6 @@ window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted' || cancelled) return;
 
-      // Try high-accuracy first, fall back to lower accuracy after 5s
       let loc;
       try {
         loc = await Promise.race([
@@ -456,7 +431,7 @@ window.addEventListener('message',function(e){try{var d=JSON.parse(e.data);if(d.
     ? (totalDist / 1000).toFixed(2) + ' km'
     : Math.round(totalDist) + ' m';
   const accDisplay = gpsAcc ? gpsAcc.toFixed(0) + 'm' : '--';
-const activity = speed === 0 ? 'Stationary' : speed * 3.6 < 5 ? 'Walking' : speed * 3.6 < 20 ? 'Cycling' : 'Driving';
+  const activity = speed === 0 ? 'Stationary' : speed * 3.6 < 5 ? 'Walking' : speed * 3.6 < 20 ? 'Cycling' : 'Driving';
 
   return (
     <SafeAreaView style={styles.container}>
@@ -508,8 +483,14 @@ const activity = speed === 0 ? 'Stationary' : speed * 3.6 < 5 ? 'Walking' : spee
       {/* COORDS + SERVER */}
       <View style={styles.infoCard}>
         <Row label="Position" value={`${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`} />
-        <Row label="Server" value={serverStatus}
-          valueColor={serverStatus === 'Synced' ? '#16a34a' : serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626' : '#888'} />
+        <Row
+          label="Server"
+          value={serverStatus}
+          valueColor={
+            serverStatus === 'Synced' ? '#16a34a' :
+            serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626' : '#888'
+          }
+        />
       </View>
 
       {/* BUTTONS */}

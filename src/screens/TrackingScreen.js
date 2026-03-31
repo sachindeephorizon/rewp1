@@ -82,8 +82,11 @@ export default function TrackingScreen({ user, onLogout }) {
           setTotalDist(distRef.current);
         }
 
-        const { ok } = await sendPing(userId, r);
-        setServerStatus(ok ? 'Synced' : 'Error');
+        const result = await sendPing(userId, r);
+        if (result.status === 'synced') setServerStatus('Synced');
+        else if (result.status === 'filtered') { /* backend filtered it — don't change status */ }
+        else if (result.status === 'offline') setServerStatus('Offline');
+        else setServerStatus('Error');
       }
     );
     subRef.current = sub;

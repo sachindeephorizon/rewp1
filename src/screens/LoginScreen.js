@@ -58,8 +58,8 @@ export default function LoginScreen({ onAuth }) {
 
   return (
     <SafeAreaView style={s.safe}>
-      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : undefined}>
-        <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled">
+      <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <View style={s.card}>
             <Text style={s.title}>Deep Horizon</Text>
             <Text style={s.sub}>{isSignUp ? 'Create your account' : 'Welcome back'}</Text>
@@ -128,7 +128,7 @@ export default function LoginScreen({ onAuth }) {
 
 const s = StyleSheet.create({
   safe: { flex: 1, backgroundColor: '#F8FAFC', paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0 },
-  scroll: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24 },
+  scroll: { flexGrow: 1, justifyContent: 'center', paddingHorizontal: 24, paddingBottom: 40 },
   card: {
     backgroundColor: '#FFF', padding: 28, borderRadius: 20,
     shadowColor: '#000', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.08, shadowRadius: 12, elevation: 5,

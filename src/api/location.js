@@ -17,9 +17,11 @@ export const sendPing = async (userId, r) => {
         timestamp: r.timestamp,
       }),
     });
-    return { ok: res.ok };
+    if (!res.ok) return { ok: false, status: 'error' };
+    const data = await res.json();
+    return { ok: true, status: data.filtered ? 'filtered' : 'synced' };
   } catch {
-    return { ok: false };
+    return { ok: false, status: 'offline' };
   }
 };
 

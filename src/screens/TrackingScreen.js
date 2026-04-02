@@ -2,6 +2,7 @@ import { StatusBar } from 'expo-status-bar';
 import { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
   Platform,
   Pressable,
   StatusBar as RNStatusBar,
@@ -22,6 +23,7 @@ import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
 
 const TRACKING_ACTIVE_KEY = 'tracking_active';
+const APP_STATE_KEY = 'tracking_app_state';
 
 export default function TrackingScreen({ user, onLogout }) {
   const userId = user.name || user.email || String(user.id);
@@ -37,6 +39,21 @@ export default function TrackingScreen({ user, onLogout }) {
   const distRef = useRef(0);
   const kalmanRef = useRef(new KalmanFilter2D());
   const mapRef = useRef(null);
+
+  useEffect(() => {
+    const syncAppState = async (state) => {
+      try {
+        await SecureStore.setItemAsync(APP_STATE_KEY, state === 'active' ? 'foreground' : 'background');
+      } catch {}
+    };
+
+    syncAppState(AppState.currentState);
+    const subscription = AppState.addEventListener('change', syncAppState);
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
 
   const updateMap = (lat, lng) => {
     mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));
@@ -63,10 +80,12 @@ export default function TrackingScreen({ user, onLogout }) {
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 5000,
+        timeInterval: 1000,
         distanceInterval: 0,
       },
       async (loc) => {
+        if (AppState.currentState !== 'active') return;
+
         const r = processLocation(loc, prevRef.current, kalmanRef.current);
         if (!r) return;
 
@@ -85,6 +104,8 @@ export default function TrackingScreen({ user, onLogout }) {
         const result = await sendPing(userId, r);
         if (result.status === 'synced') setServerStatus('Synced');
         else if (result.status === 'filtered') { /* backend filtered it — don't change status */ }
+        else if (result.status === 'rate_limited') setServerStatus('Rate Limited');
+        else if (result.status === 'server_error') setServerStatus('Server Error');
         else if (result.status === 'offline') setServerStatus('Offline');
         else setServerStatus('Error');
       }
@@ -93,7 +114,7 @@ export default function TrackingScreen({ user, onLogout }) {
 
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
-      timeInterval: 10000,
+      timeInterval: 5000,
       distanceInterval: 10,
       showsBackgroundLocationIndicator: true,
       foregroundService: {
@@ -120,6 +141,7 @@ export default function TrackingScreen({ user, onLogout }) {
     const running = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK);
     if (running) await Location.stopLocationUpdatesAsync(BACKGROUND_TASK);
     await SecureStore.deleteItemAsync(STORAGE_KEY);
+    await SecureStore.deleteItemAsync(APP_STATE_KEY);
 
     resetBackgroundState();
   };
@@ -222,7 +244,7 @@ export default function TrackingScreen({ user, onLogout }) {
         <Row
           label="Server"
           value={serverStatus}
-          valueColor={serverStatus === 'Synced' ? '#16a34a' : serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626' : '#888'}
+          valueColor={serverStatus === 'Synced' ? '#16a34a' : serverStatus === 'Rate Limited' || serverStatus === 'Server Error' || serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626' : '#888'}
         />
       </View>
 

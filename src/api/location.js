@@ -17,7 +17,11 @@ export const sendPing = async (userId, r) => {
         timestamp: r.timestamp,
       }),
     });
-    if (!res.ok) return { ok: false, status: 'error' };
+    if (!res.ok) {
+      if (res.status === 429) return { ok: false, status: 'rate_limited' };
+      if (res.status >= 500) return { ok: false, status: 'server_error' };
+      return { ok: false, status: 'error' };
+    }
     const data = await res.json();
     return { ok: true, status: data.filtered ? 'filtered' : 'synced' };
   } catch {

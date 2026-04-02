@@ -4,6 +4,8 @@ import { BACKGROUND_TASK, STORAGE_KEY, BACKEND_URL } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation } from '../utils/processLocation';
 
+const APP_STATE_KEY = 'tracking_app_state';
+
 // Background state — managed exclusively by the background task.
 // Foreground must NEVER overwrite these.
 let bgPrev = null;
@@ -18,8 +20,9 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
   if (error || !data) return;
   try {
     const userId = await SecureStore.getItemAsync(STORAGE_KEY);
+    const appState = await SecureStore.getItemAsync(APP_STATE_KEY);
     const loc = data.locations?.[0];
-    if (!userId || !loc) return;
+    if (!userId || !loc || appState === 'foreground') return;
 
     const result = processLocation(loc, bgPrev, bgKalman);
     if (!result) return;

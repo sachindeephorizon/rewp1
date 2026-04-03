@@ -52,14 +52,17 @@ export { SlidingWindow };
  * @param {object} loc - GPS location object
  * @param {object|null} prev - previous processed location
  * @param {KalmanFilter2D} kalman - Kalman filter instance
- * @param {boolean} accelStationary - true if accelerometer says device is still
+ * @param {boolean} forceStationary - true to force the point to be treated as stationary
  * @param {SlidingWindow|null} window - sliding window buffer for multi-point smoothing
  */
-export const processLocation = (loc, prev, kalman, accelStationary = false, window = null) => {
+export const processLocation = (loc, prev, kalman, forceStationary = false, window = null) => {
   const { latitude, longitude, accuracy } = loc.coords;
   const ts = loc.timestamp;
 
-  if (!accuracy || accuracy > GPS.MAX_ACCURACY) return null;
+  const normalizedAccuracy =
+    typeof accuracy === 'number' && Number.isFinite(accuracy) ? accuracy : GPS.MAX_ACCURACY;
+
+  if (normalizedAccuracy <= 0 || normalizedAccuracy > GPS.MAX_ACCURACY) return null;
   if (!latitude || !longitude) return null;
   if (!ts || ts <= 0) return null;
 
@@ -77,17 +80,16 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
     const rawSpeed = distance / dt;
     if (rawSpeed > GPS.MAX_SPEED) return null;
 
-    // Scale stationary threshold by accuracy — worse GPS = higher bar to count as movement
-    const dynamicMinMovement = Math.max(GPS.MIN_MOVEMENT, accuracy * 0.8);
+    // Keep a modest movement threshold so slightly noisy fixes still get through.
+    const dynamicMinMovement = Math.max(GPS.MIN_MOVEMENT, normalizedAccuracy * 0.25);
 
-    // If accelerometer says still, treat as stationary regardless of GPS
-    if (accelStationary || distance < dynamicMinMovement) {
-      kalman.update([prev.latitude, prev.longitude], dt, accuracy, true);
+    if (forceStationary || distance < dynamicMinMovement) {
+      kalman.update([prev.latitude, prev.longitude], dt, normalizedAccuracy, true);
       return {
         latitude: prev.latitude,
         longitude: prev.longitude,
         speed: 0,
-        accuracy,
+        accuracy: normalizedAccuracy,
         timestamp: ts,
         distance: 0,
         moving: false,
@@ -95,7 +97,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
     }
 
     // Apply Kalman filter (not stationary)
-    const filtered = kalman.update([latitude, longitude], dt, accuracy, false);
+    const filtered = kalman.update([latitude, longitude], dt, normalizedAccuracy, false);
 
     // Multi-point smoothing — push Kalman output into sliding window
     let smoothLat = filtered[0];
@@ -114,7 +116,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
       latitude: smoothLat,
       longitude: smoothLng,
       speed: speed < GPS.MIN_SPEED ? 0 : speed,
-      accuracy,
+      accuracy: normalizedAccuracy,
       timestamp: ts,
       distance: smoothedDist,
       moving: true,
@@ -122,7 +124,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
   }
 
   // First reading — initialize Kalman + window
-  kalman.update([latitude, longitude], 1, accuracy);
+  kalman.update([latitude, longitude], 1, normalizedAccuracy);
   if (window) {
     window.reset();
     window.push(latitude, longitude);
@@ -132,7 +134,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
     latitude,
     longitude,
     speed: 0,
-    accuracy,
+    accuracy: normalizedAccuracy,
     timestamp: ts,
     distance: 0,
     moving: false,

@@ -6,9 +6,6 @@ import TrackingScreen from './src/screens/TrackingScreen';
 import { getMe } from './src/api/auth';
 import { STORAGE_KEY } from './src/config/constants';
 
-// Register the background task (must be at top level)
-import './src/tasks/backgroundLocation';
-
 const AUTH_TOKEN_KEY = 'auth_token';
 const AUTH_USER_KEY = 'auth_user';
 const TRACKING_ACTIVE_KEY = 'tracking_active';

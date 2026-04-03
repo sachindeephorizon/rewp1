@@ -13,10 +13,11 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
+import { Accelerometer } from 'expo-sensors';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
-import { processLocation } from '../utils/processLocation';
+import { processLocation, SlidingWindow } from '../utils/processLocation';
 import { sendPing, sendStop } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
@@ -38,10 +39,14 @@ export default function TrackingScreen({ user, onLogout }) {
   const subRef = useRef(null);
   const distRef = useRef(0);
   const kalmanRef = useRef(new KalmanFilter2D());
+  const windowRef = useRef(new SlidingWindow());
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
   const sentStationaryRef = useRef(false);
+  const accelStationaryRef = useRef(false);
+  const accelSubRef = useRef(null);
+  const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
 
   useEffect(() => {
     const syncAppState = async (state) => {
@@ -78,37 +83,65 @@ export default function TrackingScreen({ user, onLogout }) {
     setServerStatus('--');
 
     kalmanRef.current.reset();
+    windowRef.current.reset();
     prevRef.current = null;
 
+    const onGpsUpdate = (loc) => {
+      if (AppState.currentState !== 'active') return;
+
+      const r = processLocation(loc, prevRef.current, kalmanRef.current, accelStationaryRef.current, windowRef.current);
+      if (!r) return;
+
+      prevRef.current = { latitude: r.latitude, longitude: r.longitude, timestamp: r.timestamp };
+
+      setLocation({ latitude: r.latitude, longitude: r.longitude });
+      updateMap(r.latitude, r.longitude);
+      setSpeed(r.speed);
+      setGpsAcc(r.accuracy);
+
+      if (r.moving && r.distance > 0) {
+        distRef.current += r.distance;
+        setTotalDist(distRef.current);
+      }
+
+      // Adaptive GPS frequency — slow down when stationary, speed up when moving
+      const desiredInterval = r.moving ? GPS.GPS_INTERVAL_MOVING : GPS.GPS_INTERVAL_STATIONARY;
+      if (desiredInterval !== currentGpsIntervalRef.current) {
+        currentGpsIntervalRef.current = desiredInterval;
+        if (subRef.current) subRef.current.remove();
+        Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.BestForNavigation,
+            timeInterval: desiredInterval,
+            distanceInterval: 0,
+          },
+          onGpsUpdate
+        ).then((newSub) => { subRef.current = newSub; });
+      }
+
+      // Store latest processed location; ping is sent by the interval
+      latestPingRef.current = r;
+    };
+
+    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 3000,
+        timeInterval: GPS.GPS_INTERVAL_MOVING,
         distanceInterval: 0,
       },
-      (loc) => {
-        if (AppState.currentState !== 'active') return;
-
-        const r = processLocation(loc, prevRef.current, kalmanRef.current);
-        if (!r) return;
-
-        prevRef.current = { latitude: r.latitude, longitude: r.longitude, timestamp: r.timestamp };
-
-        setLocation({ latitude: r.latitude, longitude: r.longitude });
-        updateMap(r.latitude, r.longitude);
-        setSpeed(r.speed);
-        setGpsAcc(r.accuracy);
-
-        if (r.moving && r.distance > 0) {
-          distRef.current += r.distance;
-          setTotalDist(distRef.current);
-        }
-
-        // Store latest processed location; ping is sent by the interval
-        latestPingRef.current = r;
-      }
+      onGpsUpdate
     );
     subRef.current = sub;
+
+    // Accelerometer — detect physical stillness
+    Accelerometer.setUpdateInterval(1000);
+    accelSubRef.current = Accelerometer.addListener(({ x, y, z }) => {
+      // Magnitude of acceleration; ~9.8 when still (gravity only)
+      const magnitude = Math.sqrt(x * x + y * y + z * z);
+      // If magnitude is close to gravity (no motion), mark stationary
+      accelStationaryRef.current = Math.abs(magnitude - 1) < 0.05;
+    });
 
     // Send pings on a fixed 3s interval, decoupled from GPS callbacks
     latestPingRef.current = null;
@@ -155,6 +188,12 @@ export default function TrackingScreen({ user, onLogout }) {
     setIsTracking(false);
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
     setServerStatus('Stopped');
+
+    if (accelSubRef.current) {
+      accelSubRef.current.remove();
+      accelSubRef.current = null;
+    }
+    accelStationaryRef.current = false;
 
     if (pingIntervalRef.current) {
       clearInterval(pingIntervalRef.current);

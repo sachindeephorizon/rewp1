@@ -2,7 +2,7 @@ import * as TaskManager from 'expo-task-manager';
 import * as SecureStore from 'expo-secure-store';
 import { BACKGROUND_TASK, STORAGE_KEY, BACKEND_URL } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
-import { processLocation } from '../utils/processLocation';
+import { processLocation, SlidingWindow } from '../utils/processLocation';
 
 const APP_STATE_KEY = 'tracking_app_state';
 
@@ -10,10 +10,12 @@ const APP_STATE_KEY = 'tracking_app_state';
 // Foreground must NEVER overwrite these.
 let bgPrev = null;
 const bgKalman = new KalmanFilter2D();
+const bgWindow = new SlidingWindow();
 
 export const resetBackgroundState = () => {
   bgPrev = null;
   bgKalman.reset();
+  bgWindow.reset();
 };
 
 TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
@@ -24,7 +26,7 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
     const loc = data.locations?.[0];
     if (!userId || !loc || appState === 'foreground') return;
 
-    const result = processLocation(loc, bgPrev, bgKalman);
+    const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
     if (!result) return;
 
     bgPrev = { latitude: result.latitude, longitude: result.longitude, timestamp: result.timestamp };

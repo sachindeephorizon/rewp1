@@ -20,28 +20,46 @@ export const resetBackgroundState = () => {
 
 TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
   if (error || !data) return;
+
   try {
     const userId = await SecureStore.getItemAsync(STORAGE_KEY);
     const appState = await SecureStore.getItemAsync(APP_STATE_KEY);
     const loc = data.locations?.[0];
+
+    // Skip if no user, no location, or foreground is already handling it
     if (!userId || !loc || appState === 'foreground') return;
 
     const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
     if (!result) return;
 
-    bgPrev = { latitude: result.latitude, longitude: result.longitude, timestamp: result.timestamp };
+    bgPrev = {
+      latitude: result.latitude,
+      longitude: result.longitude,
+      timestamp: result.timestamp,
+    };
 
-    await fetch(`${BACKEND_URL}/${userId}/ping`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        lat: result.latitude,
-        lng: result.longitude,
-        speed: result.speed,
-        accuracy: result.accuracy,
-        timestamp: result.timestamp,
-      }),
-    });
+    // FIX: abort fetch if it hangs — prevents the OS from killing the task
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+
+    try {
+      await fetch(`${BACKEND_URL}/${userId}/ping`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          lat: result.latitude,
+          lng: result.longitude,
+          speed: result.speed,
+          accuracy: result.accuracy,
+          timestamp: result.timestamp,
+        }),
+        signal: controller.signal,
+      });
+    } catch {
+      // Network error or aborted — safe to ignore, next task run will retry
+    } finally {
+      clearTimeout(timeout);
+    }
   } catch (err) {
     console.error('Background sync failed:', err);
   }

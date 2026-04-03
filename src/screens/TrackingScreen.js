@@ -41,6 +41,7 @@ export default function TrackingScreen({ user, onLogout }) {
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
+  const sentStationaryRef = useRef(false);
 
   useEffect(() => {
     const syncAppState = async (state) => {
@@ -82,7 +83,7 @@ export default function TrackingScreen({ user, onLogout }) {
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: 1000,
+        timeInterval: 3000,
         distanceInterval: 0,
       },
       (loc) => {
@@ -111,10 +112,22 @@ export default function TrackingScreen({ user, onLogout }) {
 
     // Send pings on a fixed 3s interval, decoupled from GPS callbacks
     latestPingRef.current = null;
+    sentStationaryRef.current = false;
     pingIntervalRef.current = setInterval(async () => {
       const r = latestPingRef.current;
       if (!r) return;
+
+      // If stationary and we already sent once, skip
+      if (!r.moving && sentStationaryRef.current) return;
+
       latestPingRef.current = null;
+
+      if (r.moving) {
+        sentStationaryRef.current = false;
+      } else {
+        sentStationaryRef.current = true;
+      }
+
       const result = await sendPing(userId, r);
       if (result.status === 'synced') setServerStatus('Synced');
       else if (result.status === 'filtered') { /* backend filtered — keep status */ }
@@ -148,6 +161,7 @@ export default function TrackingScreen({ user, onLogout }) {
       pingIntervalRef.current = null;
     }
     latestPingRef.current = null;
+    sentStationaryRef.current = false;
 
     if (subRef.current) {
       subRef.current.remove();

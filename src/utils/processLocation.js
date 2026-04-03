@@ -28,9 +28,9 @@ export const processLocation = (loc, prev, kalman) => {
     const rawSpeed = distance / dt;
     if (rawSpeed > GPS.MAX_SPEED) return null;
 
-    // Stationary: drift < 3m → clamp position, zero speed
+    // Stationary: drift < threshold → clamp position, zero speed
     if (distance < GPS.MIN_MOVEMENT) {
-      kalman.update([prev.latitude, prev.longitude], dt, accuracy);
+      kalman.update([prev.latitude, prev.longitude], dt, accuracy, true);
       return {
         latitude: prev.latitude,
         longitude: prev.longitude,
@@ -42,8 +42,8 @@ export const processLocation = (loc, prev, kalman) => {
       };
     }
 
-    // Apply Kalman filter
-    const filtered = kalman.update([latitude, longitude], dt, accuracy);
+    // Apply Kalman filter (not stationary)
+    const filtered = kalman.update([latitude, longitude], dt, accuracy, false);
     const filteredDist = getDistance(prev, { latitude: filtered[0], longitude: filtered[1] });
     const speed = filteredDist / dt;
 

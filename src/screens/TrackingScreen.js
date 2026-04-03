@@ -39,6 +39,8 @@ export default function TrackingScreen({ user, onLogout }) {
   const distRef = useRef(0);
   const kalmanRef = useRef(new KalmanFilter2D());
   const mapRef = useRef(null);
+  const latestPingRef = useRef(null);
+  const pingIntervalRef = useRef(null);
 
   useEffect(() => {
     const syncAppState = async (state) => {
@@ -83,7 +85,7 @@ export default function TrackingScreen({ user, onLogout }) {
         timeInterval: 1000,
         distanceInterval: 0,
       },
-      async (loc) => {
+      (loc) => {
         if (AppState.currentState !== 'active') return;
 
         const r = processLocation(loc, prevRef.current, kalmanRef.current);
@@ -101,16 +103,26 @@ export default function TrackingScreen({ user, onLogout }) {
           setTotalDist(distRef.current);
         }
 
-        const result = await sendPing(userId, r);
-        if (result.status === 'synced') setServerStatus('Synced');
-        else if (result.status === 'filtered') { /* backend filtered it — don't change status */ }
-        else if (result.status === 'rate_limited') setServerStatus('Rate Limited');
-        else if (result.status === 'server_error') setServerStatus('Server Error');
-        else if (result.status === 'offline') setServerStatus('Offline');
-        else setServerStatus('Error');
+        // Store latest processed location; ping is sent by the interval
+        latestPingRef.current = r;
       }
     );
     subRef.current = sub;
+
+    // Send pings on a fixed 3s interval, decoupled from GPS callbacks
+    latestPingRef.current = null;
+    pingIntervalRef.current = setInterval(async () => {
+      const r = latestPingRef.current;
+      if (!r) return;
+      latestPingRef.current = null;
+      const result = await sendPing(userId, r);
+      if (result.status === 'synced') setServerStatus('Synced');
+      else if (result.status === 'filtered') { /* backend filtered — keep status */ }
+      else if (result.status === 'rate_limited') { /* ignore, next interval will retry */ }
+      else if (result.status === 'server_error') setServerStatus('Server Error');
+      else if (result.status === 'offline') setServerStatus('Offline');
+      else setServerStatus('Error');
+    }, 3000);
 
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
@@ -130,6 +142,12 @@ export default function TrackingScreen({ user, onLogout }) {
     setIsTracking(false);
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
     setServerStatus('Stopped');
+
+    if (pingIntervalRef.current) {
+      clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
+    }
+    latestPingRef.current = null;
 
     if (subRef.current) {
       subRef.current.remove();

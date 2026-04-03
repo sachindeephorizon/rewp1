@@ -1,4 +1,4 @@
-export const BACKEND_URL = 'https://live-tracker-zz5c.onrender.com';
+export const BACKEND_URL = 'https://livetracker-production-e412.up.railway.app';
 export const BACKGROUND_TASK = 'background-location-task';
 export const STORAGE_KEY = 'activeUserId';
 

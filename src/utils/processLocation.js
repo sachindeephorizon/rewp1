@@ -55,7 +55,7 @@ export { SlidingWindow };
  * @param {boolean} forceStationary - true to force the point to be treated as stationary
  * @param {SlidingWindow|null} window - sliding window buffer for multi-point smoothing
  */
-export const processLocation = (loc, prev, kalman, forceStationary = false, window = null) => {
+export const processLocation = (loc, prev, kalman, forceStationary = false) => {
   const { latitude, longitude, accuracy } = loc.coords;
   const ts = loc.timestamp;
 
@@ -96,39 +96,25 @@ export const processLocation = (loc, prev, kalman, forceStationary = false, wind
       };
     }
 
-    // Apply Kalman filter (not stationary)
+    // Apply Kalman filter only — no sliding window (was causing lag + wrong coords)
     const filtered = kalman.update([latitude, longitude], dt, normalizedAccuracy, false);
 
-    // Multi-point smoothing — push Kalman output into sliding window
-    let smoothLat = filtered[0];
-    let smoothLng = filtered[1];
-    if (window) {
-      window.push(filtered[0], filtered[1]);
-      const avg = window.average();
-      smoothLat = avg.lat;
-      smoothLng = avg.lng;
-    }
-
-    const smoothedDist = getDistance(prev, { latitude: smoothLat, longitude: smoothLng });
-    const speed = smoothedDist / dt;
+    const filteredDist = getDistance(prev, { latitude: filtered[0], longitude: filtered[1] });
+    const speed = filteredDist / dt;
 
     return {
-      latitude: smoothLat,
-      longitude: smoothLng,
+      latitude: filtered[0],
+      longitude: filtered[1],
       speed: speed < GPS.MIN_SPEED ? 0 : speed,
       accuracy: normalizedAccuracy,
       timestamp: ts,
-      distance: smoothedDist,
+      distance: filteredDist,
       moving: true,
     };
   }
 
-  // First reading — initialize Kalman + window
+  // First reading — initialize Kalman
   kalman.update([latitude, longitude], 1, normalizedAccuracy);
-  if (window) {
-    window.reset();
-    window.push(latitude, longitude);
-  }
 
   return {
     latitude,

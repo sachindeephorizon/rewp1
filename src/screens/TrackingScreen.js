@@ -16,7 +16,7 @@ import * as SecureStore from 'expo-secure-store';
 import * as IntentLauncher from 'expo-intent-launcher';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
-import { sendPing, sendStop } from '../api/location';
+import { sendPing, sendStop, fetchSessionDistance } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
@@ -84,21 +84,30 @@ export default function TrackingScreen({ user, onLogout }) {
   const pingIntervalRef = useRef(null);
   const lastStationaryPingRef = useRef(0);
 
-  // ── APP STATE SYNC ──
+  // ── APP STATE SYNC + DISTANCE RESYNC ──
   useEffect(() => {
-    const syncAppState = async (state) => {
+    const onAppStateChange = async (state) => {
       try {
         await SecureStore.setItemAsync(
           APP_STATE_KEY,
           state === 'active' ? 'foreground' : 'background'
         );
       } catch {}
+
+      // When app comes back to foreground, sync distance from backend
+      if (state === 'active' && isTracking) {
+        const dist = await fetchSessionDistance(userId);
+        if (dist != null && dist > distRef.current) {
+          distRef.current = dist;
+          setTotalDist(dist);
+        }
+      }
     };
 
-    syncAppState(AppState.currentState);
-    const subscription = AppState.addEventListener('change', syncAppState);
+    onAppStateChange(AppState.currentState);
+    const subscription = AppState.addEventListener('change', onAppStateChange);
     return () => subscription.remove();
-  }, []);
+  }, [isTracking, userId]);
 
   const updateMap = (lat, lng) => {
     mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));

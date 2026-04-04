@@ -18,7 +18,7 @@ import * as SecureStore from 'expo-secure-store';
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
-import { sendPing, sendStop } from '../api/location';
+import { sendPing, sendStop, fetchSessionDistance } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
@@ -51,21 +51,30 @@ export default function TrackingScreen({ user, onLogout }) {
   const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
   const restartingGpsRef = useRef(false);    // FIX 2: prevent concurrent GPS restarts
 
-  // ── APP STATE SYNC ──
+  // ── APP STATE SYNC + DISTANCE RESYNC ──
   useEffect(() => {
-    const syncAppState = async (state) => {
+    const onAppStateChange = async (state) => {
       try {
         await SecureStore.setItemAsync(
           APP_STATE_KEY,
           state === 'active' ? 'foreground' : 'background'
         );
       } catch {}
+
+      // When app comes back to foreground, sync distance from backend
+      if (state === 'active' && isTracking) {
+        const dist = await fetchSessionDistance(userId);
+        if (dist != null && dist > distRef.current) {
+          distRef.current = dist;
+          setTotalDist(dist);
+        }
+      }
     };
 
-    syncAppState(AppState.currentState);
-    const subscription = AppState.addEventListener('change', syncAppState);
+    onAppStateChange(AppState.currentState);
+    const subscription = AppState.addEventListener('change', onAppStateChange);
     return () => subscription.remove();
-  }, []);
+  }, [isTracking, userId]);
 
   const updateMap = (lat, lng) => {
     mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));

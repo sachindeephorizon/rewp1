@@ -1,4 +1,5 @@
 import { StatusBar } from 'expo-status-bar';
+import * as IntentLauncher from 'expo-intent-launcher';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -79,6 +80,15 @@ export default function TrackingScreen({ user, onLogout }) {
     if (fg.status !== 'granted') return;
     const bg = await Location.requestBackgroundPermissionsAsync();
     if (bg.status !== 'granted') console.warn('Background permission denied');
+
+    if (Platform.OS === 'android') {
+      try {
+        await IntentLauncher.startActivityAsync(
+          IntentLauncher.ActivityAction.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+          { data: 'package:com.sachin2810.location_service' }
+        );
+      } catch {}
+    }
 
     setIsTracking(true);
     await SecureStore.setItemAsync(TRACKING_ACTIVE_KEY, 'true');

@@ -15,7 +15,6 @@ import {
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
 import * as IntentLauncher from 'expo-intent-launcher';
-import { Accelerometer } from 'expo-sensors';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
@@ -52,8 +51,6 @@ export default function TrackingScreen({ user, onLogout }) {
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const lastStationaryPingRef = useRef(0);
-  const accelStationaryRef = useRef(false);
-  const accelSubRef = useRef(null);
   const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
   const restartingGpsRef = useRef(false);
   const pingLoopActiveRef = useRef(false);
@@ -190,7 +187,7 @@ export default function TrackingScreen({ user, onLogout }) {
         loc,
         prevRef.current,
         kalmanRef.current,
-        accelStationaryRef.current,
+        false,
         windowRef.current
       );
 
@@ -264,12 +261,6 @@ export default function TrackingScreen({ user, onLogout }) {
     subRef.current = sub;
     addLog('info', 'GPS watcher started');
 
-    Accelerometer.setUpdateInterval(1000);
-    accelSubRef.current = Accelerometer.addListener(({ x, y, z }) => {
-      const magnitude = Math.sqrt(x * x + y * y + z * z);
-      accelStationaryRef.current = Math.abs(magnitude - 1) < 0.05;
-    });
-
     latestPingRef.current = null;
     runPingLoop(userId);
 
@@ -296,11 +287,6 @@ export default function TrackingScreen({ user, onLogout }) {
     pingLoopActiveRef.current = false;
     addLog('info', `Tracking stopped. Pings: ${pingCountRef.current}`);
 
-    if (accelSubRef.current) {
-      accelSubRef.current.remove();
-      accelSubRef.current = null;
-    }
-    accelStationaryRef.current = false;
     latestPingRef.current = null;
     lastStationaryPingRef.current = 0;
     restartingGpsRef.current = false;

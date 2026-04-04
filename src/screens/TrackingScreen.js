@@ -17,7 +17,7 @@ import * as SecureStore from 'expo-secure-store';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
-import { processLocation, SlidingWindow } from '../utils/processLocation';
+import { processLocation } from '../utils/processLocation';
 import { sendPing, sendStop, fetchSessionDistance } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
@@ -43,7 +43,6 @@ export default function TrackingScreen({ user, onLogout }) {
   const subRef = useRef(null);
   const distRef = useRef(0);
   const kalmanRef = useRef(new KalmanFilter2D());
-  const windowRef = useRef(new SlidingWindow());
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
@@ -105,9 +104,7 @@ export default function TrackingScreen({ user, onLogout }) {
     lastStationaryPingRef.current = 0;
 
     kalmanRef.current.reset();
-    windowRef.current.reset();
     prevRef.current = null;
-    restartingGpsRef.current = false;
 
     // ── GPS CALLBACK ──
     const onGpsUpdate = (loc) => {
@@ -120,8 +117,7 @@ export default function TrackingScreen({ user, onLogout }) {
         loc,
         prevRef.current,
         kalmanRef.current,
-        false,
-        windowRef.current
+        false
       );
       if (!r) return;
 

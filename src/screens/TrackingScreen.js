@@ -14,8 +14,11 @@ import {
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
 import * as IntentLauncher from 'expo-intent-launcher';
+import { Accelerometer } from 'expo-sensors';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
+import { KalmanFilter2D } from '../utils/KalmanFilter2D';
+import { processLocation, SlidingWindow } from '../utils/processLocation';
 import { sendPing, sendStop, fetchSessionDistance } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
@@ -24,47 +27,6 @@ import Row from '../components/Row';
 const TRACKING_ACTIVE_KEY = 'tracking_active';
 const APP_STATE_KEY = 'tracking_app_state';
 const STATIONARY_PING_COOLDOWN = 30_000;
-
-// ── Light filtering only ─────────────────────────────────────────────
-// Drops bad GPS readings only (poor accuracy, impossible jumps/speed).
-// All heavy smoothing (Kalman, sliding window) is done on the backend.
-const getDistance = (a, b) => {
-  const R = 6371000;
-  const dLat = ((b.latitude - a.latitude) * Math.PI) / 180;
-  const dLng = ((b.longitude - a.longitude) * Math.PI) / 180;
-  const s =
-    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-    Math.cos((a.latitude * Math.PI) / 180) *
-      Math.cos((b.latitude * Math.PI) / 180) *
-      Math.sin(dLng / 2) *
-      Math.sin(dLng / 2);
-  return R * 2 * Math.atan2(Math.sqrt(s), Math.sqrt(1 - s));
-};
-
-const lightFilter = (loc, prev) => {
-  const { latitude, longitude, accuracy } = loc.coords;
-  const ts = loc.timestamp;
-
-  if (!accuracy || accuracy > GPS.MAX_ACCURACY) return null;
-  if (!latitude || !longitude) return null;
-
-  if (prev) {
-    const timeDiff = ts - prev.timestamp;
-    if (timeDiff < GPS.MIN_TIME_MS) return null;
-
-    const distance = getDistance(prev, { latitude, longitude });
-    const dt = timeDiff / 1000;
-    const speed = distance / dt;
-
-    if (distance > GPS.MAX_JUMP) return null;
-    if (speed > GPS.MAX_SPEED) return null;
-
-    const moving = distance >= GPS.MIN_MOVEMENT;
-    return { latitude, longitude, accuracy, timestamp: ts, speed, distance, moving };
-  }
-
-  return { latitude, longitude, accuracy, timestamp: ts, speed: 0, distance: 0, moving: false };
-};
 
 export default function TrackingScreen({ user, onLogout }) {
   const userId = user.name || user.email || String(user.id);
@@ -79,10 +41,16 @@ export default function TrackingScreen({ user, onLogout }) {
   const prevRef = useRef(null);
   const subRef = useRef(null);
   const distRef = useRef(0);
+  const kalmanRef = useRef(new KalmanFilter2D());
+  const windowRef = useRef(new SlidingWindow());
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
   const lastStationaryPingRef = useRef(0);
+  const accelStationaryRef = useRef(false);
+  const accelSubRef = useRef(null);
+  const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
+  const restartingGpsRef = useRef(false);
 
   // ── APP STATE SYNC + DISTANCE RESYNC ──
   useEffect(() => {
@@ -94,7 +62,6 @@ export default function TrackingScreen({ user, onLogout }) {
         );
       } catch {}
 
-      // When app comes back to foreground, sync distance from backend
       if (state === 'active' && isTracking) {
         const dist = await fetchSessionDistance(userId);
         if (dist != null && dist > distRef.current) {
@@ -114,6 +81,8 @@ export default function TrackingScreen({ user, onLogout }) {
   };
 
   // ── DOZE MODE FIX ──
+  // Android freezes all network + GPS after ~15-30 min of screen off.
+  // This prompts the user to exempt the app — required for overnight tracking.
   const requestBatteryExemption = async () => {
     if (Platform.OS !== 'android') return;
     try {
@@ -121,7 +90,9 @@ export default function TrackingScreen({ user, onLogout }) {
         IntentLauncher.ActivityAction.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
         { data: 'package:com.sachin2810.location_service' }
       );
-    } catch {}
+    } catch {
+      // User dismissed or device doesn't support — non-fatal
+    }
   };
 
   // ── START TRACKING ──
@@ -133,6 +104,7 @@ export default function TrackingScreen({ user, onLogout }) {
     const bg = await Location.requestBackgroundPermissionsAsync();
     if (bg.status !== 'granted') console.warn('Background permission denied');
 
+    // Ask user to disable battery optimization — critical for screen-off tracking
     await requestBatteryExemption();
 
     setIsTracking(true);
@@ -141,11 +113,23 @@ export default function TrackingScreen({ user, onLogout }) {
     setTotalDist(0);
     setServerStatus('--');
     lastStationaryPingRef.current = 0;
+
+    kalmanRef.current.reset();
+    windowRef.current.reset();
     prevRef.current = null;
+    restartingGpsRef.current = false;
 
     // ── GPS CALLBACK ──
     const onGpsUpdate = (loc) => {
-      const r = lightFilter(loc, prevRef.current);
+      // FIX 1: No AppState guard — GPS processing must run even when screen is off.
+      // Only UI updates are gated below.
+      const r = processLocation(
+        loc,
+        prevRef.current,
+        kalmanRef.current,
+        accelStationaryRef.current,
+        windowRef.current
+      );
       if (!r) return;
 
       prevRef.current = {
@@ -154,7 +138,7 @@ export default function TrackingScreen({ user, onLogout }) {
         timestamp: r.timestamp,
       };
 
-      // Only update UI when app is visible
+      // Only update React state / map when app is visible
       if (AppState.currentState === 'active') {
         setLocation({ latitude: r.latitude, longitude: r.longitude });
         updateMap(r.latitude, r.longitude);
@@ -168,8 +152,41 @@ export default function TrackingScreen({ user, onLogout }) {
 
       // Always update ping ref regardless of screen state
       latestPingRef.current = r;
+
+      // FIX 2: Adaptive GPS restart — one at a time, old sub removed after new is live
+      const desiredInterval = r.moving
+        ? GPS.GPS_INTERVAL_MOVING
+        : GPS.GPS_INTERVAL_STATIONARY;
+
+      if (
+        desiredInterval !== currentGpsIntervalRef.current &&
+        !restartingGpsRef.current
+      ) {
+        restartingGpsRef.current = true;
+        currentGpsIntervalRef.current = desiredInterval;
+        const oldSub = subRef.current;
+
+        Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.BestForNavigation,
+            timeInterval: desiredInterval,
+            distanceInterval: 0,
+          },
+          onGpsUpdate
+        )
+          .then((newSub) => {
+            subRef.current = newSub;
+            if (oldSub) oldSub.remove();
+            restartingGpsRef.current = false;
+          })
+          .catch(() => {
+            restartingGpsRef.current = false;
+          });
+      }
     };
 
+    // Initial GPS subscription
+    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
@@ -180,7 +197,15 @@ export default function TrackingScreen({ user, onLogout }) {
     );
     subRef.current = sub;
 
-    // ── PING INTERVAL ──
+    // Accelerometer — detect physical stillness
+    Accelerometer.setUpdateInterval(1000);
+    accelSubRef.current = Accelerometer.addListener(({ x, y, z }) => {
+      const magnitude = Math.sqrt(x * x + y * y + z * z);
+      // ~1g when perfectly still (gravity only), tolerance ±0.05g
+      accelStationaryRef.current = Math.abs(magnitude - 1) < 0.05;
+    });
+
+    // FIX 3: Time-based cooldown instead of permanent boolean latch
     latestPingRef.current = null;
     pingIntervalRef.current = setInterval(async () => {
       const r = latestPingRef.current;
@@ -203,7 +228,7 @@ export default function TrackingScreen({ user, onLogout }) {
       else setServerStatus('Error');
     }, 3000);
 
-    // ── BACKGROUND TASK ──
+    // Background task — handles tracking when OS suspends the foreground watcher
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
       timeInterval: 5000,
@@ -223,12 +248,19 @@ export default function TrackingScreen({ user, onLogout }) {
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
     setServerStatus('Stopped');
 
+    if (accelSubRef.current) {
+      accelSubRef.current.remove();
+      accelSubRef.current = null;
+    }
+    accelStationaryRef.current = false;
+
     if (pingIntervalRef.current) {
       clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = null;
     }
     latestPingRef.current = null;
     lastStationaryPingRef.current = 0;
+    restartingGpsRef.current = false;
 
     if (subRef.current) {
       subRef.current.remove();

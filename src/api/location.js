@@ -39,6 +39,22 @@ export const sendPing = async (userId, r) => {
 };
 
 /**
+ * Fetch total distance for the active session from backend.
+ */
+export const fetchSessionDistance = async (userId) => {
+  try {
+    const res = await fetch(`${BACKEND_URL}/user/${userId}/session-distance`, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.ok ? data.distance : null;
+  } catch {
+    return null;
+  }
+};
+
+/**
  * Tell backend to flush session from Redis → PostgreSQL.
  * Aborts after 8s — fire-and-forget but shouldn't hang forever.
  */

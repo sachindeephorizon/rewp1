@@ -1,5 +1,4 @@
 import { StatusBar } from 'expo-status-bar';
-import * as IntentLauncher from 'expo-intent-launcher';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -14,19 +13,19 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
+import * as IntentLauncher from 'expo-intent-launcher';
+import { Accelerometer } from 'expo-sensors';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
-import { processLocation } from '../utils/processLocation';
-import { sendPing, sendStop, fetchSessionDistance } from '../api/location';
+import { processLocation, SlidingWindow } from '../utils/processLocation';
+import { sendPing, sendStop } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
 
 const TRACKING_ACTIVE_KEY = 'tracking_active';
 const APP_STATE_KEY = 'tracking_app_state';
-
-// How long to wait before re-pinging the server when stationary (ms)
 const STATIONARY_PING_COOLDOWN = 30_000;
 
 export default function TrackingScreen({ user, onLogout }) {
@@ -43,42 +42,52 @@ export default function TrackingScreen({ user, onLogout }) {
   const subRef = useRef(null);
   const distRef = useRef(0);
   const kalmanRef = useRef(new KalmanFilter2D());
+  const windowRef = useRef(new SlidingWindow());
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
   const lastStationaryPingRef = useRef(0);
+  const accelStationaryRef = useRef(false);
+  const accelSubRef = useRef(null);
+  const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
+  const restartingGpsRef = useRef(false);
 
-  // ── APP STATE SYNC + DISTANCE RESYNC ──
+  // ── APP STATE SYNC ──
   useEffect(() => {
-    const onAppStateChange = async (state) => {
+    const syncAppState = async (state) => {
       try {
         await SecureStore.setItemAsync(
           APP_STATE_KEY,
           state === 'active' ? 'foreground' : 'background'
         );
       } catch {}
-
-      // When app comes back to foreground, sync distance from backend
-      if (state === 'active' && isTracking) {
-        const dist = await fetchSessionDistance(userId);
-        if (dist != null && dist > distRef.current) {
-          distRef.current = dist;
-          setTotalDist(dist);
-        }
-      }
     };
 
-    onAppStateChange(AppState.currentState);
-    const subscription = AppState.addEventListener('change', onAppStateChange);
+    syncAppState(AppState.currentState);
+    const subscription = AppState.addEventListener('change', syncAppState);
     return () => subscription.remove();
-  }, [isTracking, userId]);
+  }, []);
 
   const updateMap = (lat, lng) => {
     mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));
   };
 
+  // ── DOZE MODE FIX ──
+  // Android freezes all network + GPS after ~15-30 min of screen off.
+  // This prompts the user to exempt the app — required for overnight tracking.
+  const requestBatteryExemption = async () => {
+    if (Platform.OS !== 'android') return;
+    try {
+      await IntentLauncher.startActivityAsync(
+        IntentLauncher.ActivityAction.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+        { data: 'package:com.sachin2810.location_service' }
+      );
+    } catch {
+      // User dismissed or device doesn't support — non-fatal
+    }
+  };
+
   // ── START TRACKING ──
-  // FIX 4: useCallback so auto-resume useEffect always gets a stable reference
   const startTracking = useCallback(async () => {
     await SecureStore.setItemAsync(STORAGE_KEY, userId);
 
@@ -87,14 +96,8 @@ export default function TrackingScreen({ user, onLogout }) {
     const bg = await Location.requestBackgroundPermissionsAsync();
     if (bg.status !== 'granted') console.warn('Background permission denied');
 
-    if (Platform.OS === 'android') {
-      try {
-        await IntentLauncher.startActivityAsync(
-          IntentLauncher.ActivityAction.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-          { data: 'package:com.sachin2810.location_service' }
-        );
-      } catch {}
-    }
+    // Ask user to disable battery optimization — critical for screen-off tracking
+    await requestBatteryExemption();
 
     setIsTracking(true);
     await SecureStore.setItemAsync(TRACKING_ACTIVE_KEY, 'true');
@@ -104,20 +107,20 @@ export default function TrackingScreen({ user, onLogout }) {
     lastStationaryPingRef.current = 0;
 
     kalmanRef.current.reset();
+    windowRef.current.reset();
     prevRef.current = null;
+    restartingGpsRef.current = false;
 
     // ── GPS CALLBACK ──
     const onGpsUpdate = (loc) => {
-      // FIX 1: removed "if (AppState.currentState !== 'active') return"
-      // That was silently dropping every GPS update when the screen turned off,
-      // causing latestPingRef to go stale and all pings to stop.
-      // Processing always runs; UI updates are gated separately below.
-
+      // FIX 1: No AppState guard — GPS processing must run even when screen is off.
+      // Only UI updates are gated below.
       const r = processLocation(
         loc,
         prevRef.current,
         kalmanRef.current,
-        false
+        accelStationaryRef.current,
+        windowRef.current
       );
       if (!r) return;
 
@@ -127,7 +130,7 @@ export default function TrackingScreen({ user, onLogout }) {
         timestamp: r.timestamp,
       };
 
-      // Only update React state / map when the app is visible
+      // Only update React state / map when app is visible
       if (AppState.currentState === 'active') {
         setLocation({ latitude: r.latitude, longitude: r.longitude });
         updateMap(r.latitude, r.longitude);
@@ -139,11 +142,43 @@ export default function TrackingScreen({ user, onLogout }) {
         }
       }
 
-      // Always keep the latest point so the ping interval can send it
+      // Always update ping ref regardless of screen state
       latestPingRef.current = r;
+
+      // FIX 2: Adaptive GPS — one restart at a time, old sub removed after new is live
+      const desiredInterval = r.moving
+        ? GPS.GPS_INTERVAL_MOVING
+        : GPS.GPS_INTERVAL_STATIONARY;
+
+      if (
+        desiredInterval !== currentGpsIntervalRef.current &&
+        !restartingGpsRef.current
+      ) {
+        restartingGpsRef.current = true;
+        currentGpsIntervalRef.current = desiredInterval;
+        const oldSub = subRef.current;
+
+        Location.watchPositionAsync(
+          {
+            accuracy: Location.Accuracy.BestForNavigation,
+            timeInterval: desiredInterval,
+            distanceInterval: 0,
+          },
+          onGpsUpdate
+        )
+          .then((newSub) => {
+            subRef.current = newSub;
+            if (oldSub) oldSub.remove();
+            restartingGpsRef.current = false;
+          })
+          .catch(() => {
+            restartingGpsRef.current = false;
+          });
+      }
     };
 
-    // Fixed GPS interval — no adaptive switching
+    // Initial GPS subscription
+    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,
@@ -154,9 +189,14 @@ export default function TrackingScreen({ user, onLogout }) {
     );
     subRef.current = sub;
 
-    // FIX 3: Ping interval with time-based cooldown instead of a permanent latch.
-    // The old sentStationaryRef could permanently block all pings if GPS briefly
-    // stuttered while stationary, causing a complete tracking freeze.
+    // Accelerometer — detect physical stillness
+    Accelerometer.setUpdateInterval(1000);
+    accelSubRef.current = Accelerometer.addListener(({ x, y, z }) => {
+      const magnitude = Math.sqrt(x * x + y * y + z * z);
+      accelStationaryRef.current = Math.abs(magnitude - 1) < 0.05;
+    });
+
+    // FIX 3: Time-based cooldown instead of permanent boolean latch
     latestPingRef.current = null;
     pingIntervalRef.current = setInterval(async () => {
       const r = latestPingRef.current;
@@ -172,14 +212,14 @@ export default function TrackingScreen({ user, onLogout }) {
 
       const result = await sendPing(userId, r);
       if (result.status === 'synced') setServerStatus('Synced');
-      else if (result.status === 'filtered') { /* backend filtered — keep status */ }
-      else if (result.status === 'rate_limited') { /* next interval will retry */ }
+      else if (result.status === 'filtered') { /* backend filtered */ }
+      else if (result.status === 'rate_limited') { /* retry next interval */ }
       else if (result.status === 'server_error') setServerStatus('Server Error');
       else if (result.status === 'offline') setServerStatus('Offline');
       else setServerStatus('Error');
     }, 3000);
 
-    // Background task (handles tracking when screen is off / app is backgrounded)
+    // Background task — handles tracking when OS suspends the foreground watcher
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
       timeInterval: 5000,
@@ -199,12 +239,19 @@ export default function TrackingScreen({ user, onLogout }) {
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
     setServerStatus('Stopped');
 
+    if (accelSubRef.current) {
+      accelSubRef.current.remove();
+      accelSubRef.current = null;
+    }
+    accelStationaryRef.current = false;
+
     if (pingIntervalRef.current) {
       clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = null;
     }
     latestPingRef.current = null;
     lastStationaryPingRef.current = 0;
+    restartingGpsRef.current = false;
 
     if (subRef.current) {
       subRef.current.remove();
@@ -251,7 +298,6 @@ export default function TrackingScreen({ user, onLogout }) {
         };
       }
 
-      // FIX 4: startTracking is stable via useCallback — no stale closure on resume
       const wasTracking = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
       if (wasTracking === 'true' && !cancelled) {
         startTracking();
@@ -262,7 +308,7 @@ export default function TrackingScreen({ user, onLogout }) {
       cancelled = true;
       if (subRef.current) subRef.current.remove();
     };
-  }, [startTracking]); // safe because startTracking is memoized
+  }, [startTracking]);
 
   // ── LOADING ──
   if (!location) {
@@ -379,7 +425,6 @@ const s = StyleSheet.create({
     paddingHorizontal: 20,
     paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0,
   },
-
   loadingWrap: {
     flex: 1,
     backgroundColor: '#F8FAFC',

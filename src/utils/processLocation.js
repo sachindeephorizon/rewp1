@@ -1,59 +1,10 @@
 import { GPS } from '../config/constants';
 import { getDistance } from './geo';
 
-const WINDOW_SIZE = 5;
-
-/**
- * Sliding window buffer for multi-point smoothing.
- * Keeps last N points and returns weighted average (recent points weighted more).
- */
-class SlidingWindow {
-  constructor(size = WINDOW_SIZE) {
-    this.size = size;
-    this.buffer = [];
-  }
-
-  push(lat, lng) {
-    this.buffer.push({ lat, lng });
-    if (this.buffer.length > this.size) this.buffer.shift();
-  }
-
-  average() {
-    const len = this.buffer.length;
-    if (len === 0) return null;
-    if (len === 1) return { lat: this.buffer[0].lat, lng: this.buffer[0].lng };
-
-    // Weighted average — more recent points get higher weight
-    let totalWeight = 0;
-    let latSum = 0;
-    let lngSum = 0;
-    for (let i = 0; i < len; i++) {
-      const weight = i + 1; // 1, 2, 3, 4, 5
-      latSum += this.buffer[i].lat * weight;
-      lngSum += this.buffer[i].lng * weight;
-      totalWeight += weight;
-    }
-    return { lat: latSum / totalWeight, lng: lngSum / totalWeight };
-  }
-
-  reset() {
-    this.buffer = [];
-  }
-}
-
-// Export so TrackingScreen and background task can create instances
-export { SlidingWindow };
-
 /**
  * Core GPS processor — shared by foreground & background.
- * Filters noise, applies Kalman + sliding window, calculates speed.
+ * Filters noise, applies Kalman filter, calculates speed from distance/time.
  * Never uses coords.speed. Never sends raw GPS.
- *
- * @param {object} loc - GPS location object
- * @param {object|null} prev - previous processed location
- * @param {KalmanFilter2D} kalman - Kalman filter instance
- * @param {boolean} forceStationary - true to force the point to be treated as stationary
- * @param {SlidingWindow|null} window - sliding window buffer for multi-point smoothing
  */
 export const processLocation = (loc, prev, kalman, forceStationary = false) => {
   const { latitude, longitude, accuracy } = loc.coords;

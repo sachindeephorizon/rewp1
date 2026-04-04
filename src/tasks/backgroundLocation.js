@@ -2,18 +2,16 @@ import * as TaskManager from 'expo-task-manager';
 import * as SecureStore from 'expo-secure-store';
 import { BACKGROUND_TASK, STORAGE_KEY, BACKEND_URL } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
-import { processLocation, SlidingWindow } from '../utils/processLocation';
+import { processLocation } from '../utils/processLocation';
 
 // Background state — managed exclusively by the background task.
 // Foreground must NEVER overwrite these.
 let bgPrev = null;
 const bgKalman = new KalmanFilter2D();
-const bgWindow = new SlidingWindow();
 
 export const resetBackgroundState = () => {
   bgPrev = null;
   bgKalman.reset();
-  bgWindow.reset();
 };
 
 TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
@@ -27,7 +25,7 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
     // Screen-off delivery can still report stale app state, so don't gate on it.
     if (!userId || !loc) return;
 
-    const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
+    const result = processLocation(loc, bgPrev, bgKalman, false);
     if (!result) return;
 
     bgPrev = {

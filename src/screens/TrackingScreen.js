@@ -205,7 +205,6 @@ export default function TrackingScreen({ user, onLogout }) {
     }
     latestPingRef.current = null;
     lastStationaryPingRef.current = 0;
-    restartingGpsRef.current = false;
 
     if (subRef.current) {
       subRef.current.remove();

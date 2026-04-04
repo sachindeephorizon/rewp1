@@ -47,9 +47,7 @@ export default function TrackingScreen({ user, onLogout }) {
   const mapRef = useRef(null);
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
-  const lastStationaryPingRef = useRef(0);   // FIX 3: time-based cooldown
-  const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
-  const restartingGpsRef = useRef(false);    // FIX 2: prevent concurrent GPS restarts
+  const lastStationaryPingRef = useRef(0);
 
   // ── APP STATE SYNC + DISTANCE RESYNC ──
   useEffect(() => {
@@ -147,42 +145,9 @@ export default function TrackingScreen({ user, onLogout }) {
 
       // Always keep the latest point so the ping interval can send it
       latestPingRef.current = r;
-
-      // FIX 2: Adaptive GPS restart — only one restart at a time.
-      // Remove the old sub AFTER the new one is ready to avoid a coverage gap.
-      const desiredInterval = r.moving
-        ? GPS.GPS_INTERVAL_MOVING
-        : GPS.GPS_INTERVAL_STATIONARY;
-
-      if (
-        desiredInterval !== currentGpsIntervalRef.current &&
-        !restartingGpsRef.current
-      ) {
-        restartingGpsRef.current = true;
-        currentGpsIntervalRef.current = desiredInterval;
-        const oldSub = subRef.current;
-
-        Location.watchPositionAsync(
-          {
-            accuracy: Location.Accuracy.BestForNavigation,
-            timeInterval: desiredInterval,
-            distanceInterval: 0,
-          },
-          onGpsUpdate
-        )
-          .then((newSub) => {
-            subRef.current = newSub;
-            if (oldSub) oldSub.remove(); // remove AFTER new sub is live
-            restartingGpsRef.current = false;
-          })
-          .catch(() => {
-            restartingGpsRef.current = false; // reset guard on failure too
-          });
-      }
     };
 
-    // Initial GPS subscription
-    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
+    // Fixed GPS interval — no adaptive switching
     const sub = await Location.watchPositionAsync(
       {
         accuracy: Location.Accuracy.BestForNavigation,

@@ -14,7 +14,6 @@ import {
 import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
 import * as IntentLauncher from 'expo-intent-launcher';
-import { Accelerometer } from 'expo-sensors';
 
 import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
@@ -47,8 +46,6 @@ export default function TrackingScreen({ user, onLogout }) {
   const latestPingRef = useRef(null);
   const pingIntervalRef = useRef(null);
   const lastStationaryPingRef = useRef(0);
-  const accelStationaryRef = useRef(false);
-  const accelSubRef = useRef(null);
   const currentGpsIntervalRef = useRef(GPS.GPS_INTERVAL_MOVING);
   const restartingGpsRef = useRef(false);
 
@@ -127,7 +124,7 @@ export default function TrackingScreen({ user, onLogout }) {
         loc,
         prevRef.current,
         kalmanRef.current,
-        accelStationaryRef.current,
+        false,
         windowRef.current
       );
       if (!r) return;
@@ -197,14 +194,6 @@ export default function TrackingScreen({ user, onLogout }) {
     );
     subRef.current = sub;
 
-    // Accelerometer — detect physical stillness
-    Accelerometer.setUpdateInterval(1000);
-    accelSubRef.current = Accelerometer.addListener(({ x, y, z }) => {
-      const magnitude = Math.sqrt(x * x + y * y + z * z);
-      // ~1g when perfectly still (gravity only), tolerance ±0.05g
-      accelStationaryRef.current = Math.abs(magnitude - 1) < 0.05;
-    });
-
     // FIX 3: Time-based cooldown instead of permanent boolean latch
     latestPingRef.current = null;
     pingIntervalRef.current = setInterval(async () => {
@@ -247,12 +236,6 @@ export default function TrackingScreen({ user, onLogout }) {
     setIsTracking(false);
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
     setServerStatus('Stopped');
-
-    if (accelSubRef.current) {
-      accelSubRef.current.remove();
-      accelSubRef.current = null;
-    }
-    accelStationaryRef.current = false;
 
     if (pingIntervalRef.current) {
       clearInterval(pingIntervalRef.current);

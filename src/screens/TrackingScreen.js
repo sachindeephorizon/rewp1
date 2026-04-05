@@ -28,7 +28,12 @@ const TRACKING_ACTIVE_KEY = 'tracking_active';
 const APP_STATE_KEY = 'tracking_app_state';
 const STATIONARY_PING_COOLDOWN = 30_000;
 const PING_INTERVAL_MS = 3000;
-const MAX_LOGS = 50; // keep last 50 log lines in UI
+const MAX_LOGS = 50;
+const STATIONARY_SWITCH_THRESHOLD = 4;
+
+// If screen was off for longer than this, reset frontend GPS state
+// so the first point after resume is always accepted cleanly.
+const GAP_RESET_MS = 60_000; // 60 seconds
 
 export default function TrackingScreen({ user, onLogout }) {
   const userId = user.name || user.email || String(user.id);
@@ -55,17 +60,21 @@ export default function TrackingScreen({ user, onLogout }) {
   const restartingGpsRef = useRef(false);
   const pingLoopActiveRef = useRef(false);
   const pingCountRef = useRef(0);
+  const stationaryCountRef = useRef(0);
+  const justRestartedGpsRef = useRef(false);
+
+  // Track when screen went to background to detect long gaps
+  const backgroundSinceRef = useRef(null);
 
   // ── IN-APP LOGGER ──
   const addLog = useCallback((level, message) => {
     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
     const entry = { time, level, message, id: Date.now() + Math.random() };
-    console.log(`[${level}] ${message}`); // still log to Metro too
+    console.log(`[${level}] ${message}`);
     setDebugLogs((prev) => {
       const updated = [...prev, entry];
       return updated.length > MAX_LOGS ? updated.slice(-MAX_LOGS) : updated;
     });
-    // Auto-scroll to bottom
     setTimeout(() => logScrollRef.current?.scrollToEnd({ animated: false }), 50);
   }, []);
 
@@ -77,8 +86,30 @@ export default function TrackingScreen({ user, onLogout }) {
           APP_STATE_KEY,
           state === 'active' ? 'foreground' : 'background'
         );
-        addLog('info', `AppState → ${state}`);
       } catch {}
+
+      if (state === 'active') {
+        // Coming back from background — check if gap was long enough to reset
+        const bgSince = backgroundSinceRef.current;
+        const gapMs = bgSince ? Date.now() - bgSince : 0;
+        backgroundSinceRef.current = null;
+
+        if (gapMs > GAP_RESET_MS) {
+          addLog('info', `AppState → active (gap=${(gapMs/1000).toFixed(0)}s) — resetting GPS state`);
+          // Reset frontend GPS state so next point is treated as fresh
+          prevRef.current = null;
+          kalmanRef.current.reset();
+          windowRef.current.reset();
+          stationaryCountRef.current = 0;
+          justRestartedGpsRef.current = false;
+        } else {
+          addLog('info', `AppState → active (gap=${(gapMs/1000).toFixed(0)}s)`);
+        }
+      } else {
+        // Going to background — record when
+        backgroundSinceRef.current = Date.now();
+        addLog('info', `AppState → ${state}`);
+      }
     };
 
     syncAppState(AppState.currentState);
@@ -152,7 +183,7 @@ export default function TrackingScreen({ user, onLogout }) {
       await new Promise((resolve) => setTimeout(resolve, PING_INTERVAL_MS));
     }
 
-    addLog('info', `Ping loop stopped. Total sent: ${pingCountRef.current}`);
+    addLog('info', `Ping loop stopped. Total: ${pingCountRef.current}`);
   }, [addLog]);
 
   // ── START TRACKING ──
@@ -172,17 +203,28 @@ export default function TrackingScreen({ user, onLogout }) {
     setTotalDist(0);
     setServerStatus('--');
     lastStationaryPingRef.current = 0;
-    setDebugLogs([]); // clear logs on new session
+    setDebugLogs([]);
 
     kalmanRef.current.reset();
     windowRef.current.reset();
     prevRef.current = null;
     restartingGpsRef.current = false;
+    stationaryCountRef.current = 0;
+    justRestartedGpsRef.current = false;
+    backgroundSinceRef.current = null;
 
     addLog('info', 'Tracking started');
 
     // ── GPS CALLBACK ──
     const onGpsUpdate = (loc) => {
+      // Grace period after GPS subscription restart
+      if (justRestartedGpsRef.current) {
+        justRestartedGpsRef.current = false;
+        prevRef.current = null;
+        kalmanRef.current.reset();
+        windowRef.current.reset();
+      }
+
       const r = processLocation(
         loc,
         prevRef.current,
@@ -215,10 +257,17 @@ export default function TrackingScreen({ user, onLogout }) {
 
       latestPingRef.current = r;
 
-      // Adaptive GPS restart
-      const desiredInterval = r.moving
-        ? GPS.GPS_INTERVAL_MOVING
-        : GPS.GPS_INTERVAL_STATIONARY;
+      // Hysteresis — don't switch interval until 4 consecutive stationary readings
+      if (r.moving) {
+        stationaryCountRef.current = 0;
+      } else {
+        stationaryCountRef.current += 1;
+      }
+
+      const desiredInterval =
+        stationaryCountRef.current >= STATIONARY_SWITCH_THRESHOLD
+          ? GPS.GPS_INTERVAL_STATIONARY
+          : GPS.GPS_INTERVAL_MOVING;
 
       if (
         desiredInterval !== currentGpsIntervalRef.current &&
@@ -227,7 +276,7 @@ export default function TrackingScreen({ user, onLogout }) {
         restartingGpsRef.current = true;
         currentGpsIntervalRef.current = desiredInterval;
         const oldSub = subRef.current;
-        addLog('info', `GPS interval → ${desiredInterval}ms (moving=${r.moving})`);
+        addLog('info', `GPS interval → ${desiredInterval}ms (streak=${stationaryCountRef.current})`);
 
         Location.watchPositionAsync(
           {
@@ -241,6 +290,7 @@ export default function TrackingScreen({ user, onLogout }) {
             subRef.current = newSub;
             if (oldSub) oldSub.remove();
             restartingGpsRef.current = false;
+            justRestartedGpsRef.current = true;
           })
           .catch((err) => {
             addLog('error', `GPS restart failed: ${err.message}`);
@@ -287,6 +337,9 @@ export default function TrackingScreen({ user, onLogout }) {
     pingLoopActiveRef.current = false;
     addLog('info', `Tracking stopped. Pings: ${pingCountRef.current}`);
 
+    stationaryCountRef.current = 0;
+    justRestartedGpsRef.current = false;
+    backgroundSinceRef.current = null;
     latestPingRef.current = null;
     lastStationaryPingRef.current = 0;
     restartingGpsRef.current = false;
@@ -361,7 +414,6 @@ export default function TrackingScreen({ user, onLogout }) {
     );
   }
 
-  // ── COMPUTED VALUES ──
   const speedKmh = speed > 0 ? (speed * 3.6).toFixed(1) : '0.0';
   const distDisplay =
     totalDist >= 1000
@@ -369,13 +421,10 @@ export default function TrackingScreen({ user, onLogout }) {
       : Math.round(totalDist) + ' m';
   const accDisplay = gpsAcc ? gpsAcc.toFixed(0) + 'm' : '--';
   const activity =
-    speed === 0
-      ? 'Stationary'
-      : speed * 3.6 < 5
-      ? 'Walking'
-      : speed * 3.6 < 20
-      ? 'Cycling'
-      : 'Driving';
+    speed === 0 ? 'Stationary'
+    : speed * 3.6 < 5 ? 'Walking'
+    : speed * 3.6 < 20 ? 'Cycling'
+    : 'Driving';
 
   const logColor = (level) => {
     if (level === 'error') return '#ef4444';
@@ -385,7 +434,6 @@ export default function TrackingScreen({ user, onLogout }) {
 
   return (
     <SafeAreaView style={s.container}>
-      {/* HEADER */}
       <View style={s.header}>
         <View>
           <Text style={s.headerTitle}>{user.name || 'Deep Horizon'}</Text>
@@ -399,14 +447,12 @@ export default function TrackingScreen({ user, onLogout }) {
         </View>
       </View>
 
-      {/* SPEED */}
       <View style={s.speedSection}>
         <Text style={s.speedVal}>{speedKmh}</Text>
         <Text style={s.speedUnit}>km/h</Text>
         <Text style={s.speedLabel}>{activity}</Text>
       </View>
 
-      {/* STATS */}
       <View style={s.statsRow}>
         <View style={s.statCard}>
           <Text style={s.statVal}>{accDisplay}</Text>
@@ -418,42 +464,27 @@ export default function TrackingScreen({ user, onLogout }) {
         </View>
       </View>
 
-      {/* MINI MAP */}
       <MiniMap ref={mapRef} latitude={location.latitude} longitude={location.longitude} />
 
-      {/* COORDS + SERVER */}
       <View style={s.infoCard}>
-        <Row
-          label="Position"
-          value={`${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`}
-        />
+        <Row label="Position" value={`${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`} />
         <Row
           label="Server"
           value={serverStatus}
           valueColor={
-            serverStatus === 'Synced'
-              ? '#16a34a'
-              : serverStatus === 'Rate Limited' ||
-                serverStatus === 'Server Error' ||
-                serverStatus === 'Error' ||
-                serverStatus === 'Offline'
-              ? '#dc2626'
-              : '#888'
+            serverStatus === 'Synced' ? '#16a34a'
+            : serverStatus === 'Rate Limited' || serverStatus === 'Server Error'
+              || serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626'
+            : '#888'
           }
         />
       </View>
 
-      {/* DEBUG LOG PANEL */}
-      <Pressable
-        onPress={() => setShowLogs((v) => !v)}
-        style={s.logToggle}
-      >
+      <Pressable onPress={() => setShowLogs((v) => !v)} style={s.logToggle}>
         <Text style={s.logToggleText}>
           {showLogs ? '▲ Hide Logs' : '▼ Debug Logs'} ({debugLogs.length})
         </Text>
-        {debugLogs.some((l) => l.level === 'error') && (
-          <View style={s.errorDot} />
-        )}
+        {debugLogs.some((l) => l.level === 'error') && <View style={s.errorDot} />}
       </Pressable>
 
       {showLogs && (
@@ -463,15 +494,14 @@ export default function TrackingScreen({ user, onLogout }) {
             style={s.logScroll}
             onContentSizeChange={() => logScrollRef.current?.scrollToEnd({ animated: false })}
           >
-            {debugLogs.length === 0 ? (
-              <Text style={s.logEmpty}>No logs yet</Text>
-            ) : (
-              debugLogs.map((entry) => (
-                <Text key={entry.id} style={[s.logLine, { color: logColor(entry.level) }]}>
-                  {entry.time} {entry.message}
-                </Text>
-              ))
-            )}
+            {debugLogs.length === 0
+              ? <Text style={s.logEmpty}>No logs yet</Text>
+              : debugLogs.map((entry) => (
+                  <Text key={entry.id} style={[s.logLine, { color: logColor(entry.level) }]}>
+                    {entry.time} {entry.message}
+                  </Text>
+                ))
+            }
           </ScrollView>
           <Pressable onPress={() => setDebugLogs([])} style={s.clearBtn}>
             <Text style={s.clearBtnText}>Clear</Text>
@@ -479,7 +509,6 @@ export default function TrackingScreen({ user, onLogout }) {
         </View>
       )}
 
-      {/* BUTTONS */}
       <View style={s.actions}>
         {!isTracking ? (
           <Pressable style={s.btnTrack} onPress={startTracking}>
@@ -501,38 +530,14 @@ export default function TrackingScreen({ user, onLogout }) {
 }
 
 const s = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#F8FAFC',
-    paddingHorizontal: 20,
-    paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0,
-  },
-  loadingWrap: {
-    flex: 1,
-    backgroundColor: '#F8FAFC',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0,
-  },
+  container: { flex: 1, backgroundColor: '#F8FAFC', paddingHorizontal: 20, paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0 },
+  loadingWrap: { flex: 1, backgroundColor: '#F8FAFC', justifyContent: 'center', alignItems: 'center', paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0 },
   loadingText: { fontSize: 18, fontWeight: '700', color: '#1E293B', marginTop: 20 },
   loadingSub: { fontSize: 13, color: '#94A3B8', marginTop: 6 },
-
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingTop: 10,
-    paddingBottom: 6,
-  },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10, paddingBottom: 6 },
   headerTitle: { fontSize: 18, fontWeight: '800', color: '#0F172A' },
   headerUser: { fontSize: 12, color: '#64748B', marginTop: 1 },
-  badge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 20,
-  },
+  badge: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
   badgeOn: { backgroundColor: 'rgba(22,163,74,0.1)' },
   badgeOff: { backgroundColor: 'rgba(239,68,68,0.1)' },
   dot: { width: 8, height: 8, borderRadius: 4, marginRight: 6 },
@@ -541,114 +546,27 @@ const s = StyleSheet.create({
   badgeText: { fontSize: 12, fontWeight: '700', letterSpacing: 1 },
   badgeTextOn: { color: '#16A34A' },
   badgeTextOff: { color: '#EF4444' },
-
   speedSection: { alignItems: 'center', paddingVertical: 12 },
   speedVal: { fontSize: 48, fontWeight: '800', color: '#0F172A', lineHeight: 54 },
   speedUnit: { fontSize: 14, fontWeight: '600', color: '#64748B', marginTop: 1 },
   speedLabel: { fontSize: 12, color: '#94A3B8', marginTop: 4, fontWeight: '500' },
-
   statsRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
-  statCard: {
-    flex: 1,
-    backgroundColor: '#FFF',
-    borderRadius: 10,
-    padding: 10,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 3,
-    elevation: 2,
-  },
+  statCard: { flex: 1, backgroundColor: '#FFF', borderRadius: 10, padding: 10, alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 2 },
   statVal: { fontSize: 13, fontWeight: '700', color: '#1E293B', marginBottom: 2 },
-  statLbl: {
-    fontSize: 9,
-    color: '#94A3B8',
-    textTransform: 'uppercase',
-    fontWeight: '600',
-    letterSpacing: 0.5,
-  },
-
-  infoCard: {
-    backgroundColor: '#FFF',
-    borderRadius: 10,
-    padding: 12,
-    marginBottom: 8,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 3,
-    elevation: 2,
-  },
-
-  // ── Debug Log Panel ──
-  logToggle: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 6,
-    paddingHorizontal: 4,
-    marginBottom: 4,
-  },
-  logToggleText: {
-    fontSize: 11,
-    color: '#64748B',
-    fontWeight: '600',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  errorDot: {
-    width: 7,
-    height: 7,
-    borderRadius: 4,
-    backgroundColor: '#ef4444',
-    marginLeft: 6,
-  },
-  logPanel: {
-    backgroundColor: '#0F172A',
-    borderRadius: 8,
-    padding: 8,
-    marginBottom: 8,
-    maxHeight: 160,
-  },
-  logScroll: {
-    maxHeight: 130,
-  },
-  logLine: {
-    fontSize: 10,
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-    lineHeight: 16,
-  },
-  logEmpty: {
-    fontSize: 10,
-    color: '#475569',
-    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
-  },
-  clearBtn: {
-    alignSelf: 'flex-end',
-    marginTop: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 2,
-    backgroundColor: '#1E293B',
-    borderRadius: 4,
-  },
-  clearBtnText: {
-    fontSize: 10,
-    color: '#94A3B8',
-    fontWeight: '600',
-  },
-
+  statLbl: { fontSize: 9, color: '#94A3B8', textTransform: 'uppercase', fontWeight: '600', letterSpacing: 0.5 },
+  infoCard: { backgroundColor: '#FFF', borderRadius: 10, padding: 12, marginBottom: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 2 },
+  logToggle: { flexDirection: 'row', alignItems: 'center', paddingVertical: 6, paddingHorizontal: 4, marginBottom: 4 },
+  logToggleText: { fontSize: 11, color: '#64748B', fontWeight: '600', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  errorDot: { width: 7, height: 7, borderRadius: 4, backgroundColor: '#ef4444', marginLeft: 6 },
+  logPanel: { backgroundColor: '#0F172A', borderRadius: 8, padding: 8, marginBottom: 8, maxHeight: 160 },
+  logScroll: { maxHeight: 130 },
+  logLine: { fontSize: 10, fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace', lineHeight: 16 },
+  logEmpty: { fontSize: 10, color: '#475569', fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace' },
+  clearBtn: { alignSelf: 'flex-end', marginTop: 4, paddingHorizontal: 8, paddingVertical: 2, backgroundColor: '#1E293B', borderRadius: 4 },
+  clearBtnText: { fontSize: 10, color: '#94A3B8', fontWeight: '600' },
   actions: { marginTop: 'auto', paddingBottom: 32 },
-  btnTrack: {
-    backgroundColor: '#0F172A',
-    paddingVertical: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
-  btnStop: {
-    backgroundColor: '#EF4444',
-    paddingVertical: 14,
-    borderRadius: 10,
-    alignItems: 'center',
-  },
+  btnTrack: { backgroundColor: '#0F172A', paddingVertical: 14, borderRadius: 10, alignItems: 'center' },
+  btnStop: { backgroundColor: '#EF4444', paddingVertical: 14, borderRadius: 10, alignItems: 'center' },
   btnTextWhite: { color: '#FFF', fontSize: 15, fontWeight: '700' },
   btnLogout: { marginTop: 8, paddingVertical: 10, alignItems: 'center' },
   btnLogoutText: { color: '#64748B', fontSize: 14, fontWeight: '600' },

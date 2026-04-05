@@ -4,8 +4,9 @@ import { getDistance } from './geo';
 const WINDOW_SIZE = 5;
 
 /**
- * Sliding window buffer for multi-point smoothing.
- * Keeps last N points and returns weighted average (recent points weighted more).
+ * Sliding window — kept for export compatibility but NO LONGER USED
+ * in processLocation. Removing it from the pipeline eliminated the
+ * position lag on turns that caused scattered/looping points.
  */
 class SlidingWindow {
   constructor(size = WINDOW_SIZE) {
@@ -22,13 +23,9 @@ class SlidingWindow {
     const len = this.buffer.length;
     if (len === 0) return null;
     if (len === 1) return { lat: this.buffer[0].lat, lng: this.buffer[0].lng };
-
-    // Weighted average — more recent points get higher weight
-    let totalWeight = 0;
-    let latSum = 0;
-    let lngSum = 0;
+    let totalWeight = 0, latSum = 0, lngSum = 0;
     for (let i = 0; i < len; i++) {
-      const weight = i + 1; // 1, 2, 3, 4, 5
+      const weight = i + 1;
       latSum += this.buffer[i].lat * weight;
       lngSum += this.buffer[i].lng * weight;
       totalWeight += weight;
@@ -36,23 +33,26 @@ class SlidingWindow {
     return { lat: latSum / totalWeight, lng: lngSum / totalWeight };
   }
 
-  reset() {
-    this.buffer = [];
-  }
+  reset() { this.buffer = []; }
 }
 
 export { SlidingWindow };
 
 /**
- * Core GPS processor — shared by foreground & background.
- * Filters noise, applies Kalman + sliding window, calculates speed.
- * Never uses coords.speed. Never sends raw GPS.
+ * Core GPS processor — Kalman filter only, no sliding window.
+ *
+ * Why sliding window was removed:
+ * The 5-point weighted average introduced a ~10-15s position lag.
+ * On turns and curves this pulled the current position toward the
+ * past path, creating the looping/scattered pattern visible on the
+ * dashboard map. Kalman alone is smoother and more accurate for
+ * vehicle tracking. Road snapping on the backend handles final cleanup.
  *
  * @param {object} loc - GPS location object
  * @param {object|null} prev - previous processed location
  * @param {KalmanFilter2D} kalman - Kalman filter instance
- * @param {boolean} accelStationary - true if accelerometer says device is still
- * @param {SlidingWindow|null} window - sliding window buffer for multi-point smoothing
+ * @param {boolean} accelStationary - true if accelerometer says still
+ * @param {SlidingWindow|null} window - ignored, kept for API compatibility
  */
 export const processLocation = (loc, prev, kalman, accelStationary = false, window = null) => {
   const { latitude, longitude, accuracy } = loc.coords;
@@ -76,10 +76,8 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
     const rawSpeed = distance / dt;
     if (rawSpeed > GPS.MAX_SPEED) return null;
 
-    // FIX: use fixed MIN_MOVEMENT threshold — the old accuracy*0.8 dynamic
-    // threshold was too aggressive for vehicles (worse GPS accuracy = higher
-    // bar to count as movement = most vehicle points classified as stationary
-    // → interval jumps to 15s → only ~34 points recorded for whole trip).
+    // Fixed threshold — no accuracy multiplier
+    // (accuracy*0.8 was misclassifying vehicle movement as stationary)
     const isStationary = accelStationary || distance < GPS.MIN_MOVEMENT;
 
     if (isStationary) {
@@ -95,39 +93,25 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
       };
     }
 
-    // Apply Kalman filter (not stationary)
+    // Kalman filter only — no sliding window
     const filtered = kalman.update([latitude, longitude], dt, accuracy, false);
 
-    // Multi-point smoothing — push Kalman output into sliding window
-    let smoothLat = filtered[0];
-    let smoothLng = filtered[1];
-    if (window) {
-      window.push(filtered[0], filtered[1]);
-      const avg = window.average();
-      smoothLat = avg.lat;
-      smoothLng = avg.lng;
-    }
-
-    const smoothedDist = getDistance(prev, { latitude: smoothLat, longitude: smoothLng });
-    const speed = smoothedDist / dt;
+    const filteredDist = getDistance(prev, { latitude: filtered[0], longitude: filtered[1] });
+    const speed = filteredDist / dt;
 
     return {
-      latitude: smoothLat,
-      longitude: smoothLng,
+      latitude: filtered[0],
+      longitude: filtered[1],
       speed: speed < GPS.MIN_SPEED ? 0 : speed,
       accuracy,
       timestamp: ts,
-      distance: smoothedDist,
+      distance: filteredDist,
       moving: true,
     };
   }
 
-  // First reading — initialize Kalman + window
+  // First reading — initialize Kalman only
   kalman.update([latitude, longitude], 1, accuracy);
-  if (window) {
-    window.reset();
-    window.push(latitude, longitude);
-  }
 
   return {
     latitude,

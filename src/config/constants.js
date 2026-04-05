@@ -4,7 +4,7 @@ export const STORAGE_KEY = 'activeUserId';
 
 export const GPS = {
   MAX_ACCURACY: 100,
-  MAX_JUMP: 500,
+  MAX_JUMP: 300,
   MAX_SPEED: 80,
   MIN_MOVEMENT: 2,
   MIN_SPEED: 0.3,

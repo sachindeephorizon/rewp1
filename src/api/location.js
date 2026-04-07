@@ -1,41 +1,77 @@
 import { BACKEND_URL } from '../config/constants';
 
-/**
- * Send a processed location ping to the backend.
- * Returns { ok: boolean, status: string }.
- * Aborts after 5s to prevent promise pile-up on the ping interval.
- */
-export const sendPing = async (userId, r) => {
+const normalizePingPayload = (payload) => {
+  if (!payload) return null;
+
+  if (typeof payload.lat === 'number' && typeof payload.lng === 'number') {
+    return payload;
+  }
+
+  return {
+    lat: payload.latitude,
+    lng: payload.longitude,
+    speed: payload.speed,
+    accuracy: payload.accuracy,
+    heading: payload.heading ?? null,
+    moving: payload.moving,
+    distance: payload.distance,
+    activity: payload.activity,
+    timestamp: payload.timestamp,
+    source: payload.source,
+    appState: payload.appState,
+    sequence: payload.sequence,
+    sessionId: payload.sessionId,
+    rideChannel: payload.rideChannel,
+    gpsIntervalMs: payload.gpsIntervalMs,
+    driverId: payload.driverId,
+  };
+};
+
+export const postLocationUpdate = async (userId, payload, timeoutMs = 5000) => {
+  const requestBody = normalizePingPayload(payload);
+  if (!requestBody) {
+    return { ok: false, status: 'invalid_payload' };
+  }
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const res = await fetch(`${BACKEND_URL}/${userId}/ping`, {
+    const response = await fetch(`${BACKEND_URL}/${userId}/ping`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        lat: r.latitude,
-        lng: r.longitude,
-        speed: r.speed,
-        accuracy: r.accuracy,
-        timestamp: r.timestamp,
-      }),
+      body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
 
-    if (!res.ok) {
-      if (res.status === 429) return { ok: false, status: 'rate_limited' };
-      if (res.status >= 500) return { ok: false, status: 'server_error' };
-      return { ok: false, status: 'error' };
-    }
-
-    const data = await res.json();
-    return { ok: true, status: data.filtered ? 'filtered' : 'synced' };
+    return { ok: response.ok, response };
   } catch {
     return { ok: false, status: 'offline' };
   } finally {
     clearTimeout(timeout);
   }
+};
+
+/**
+ * Send a processed location ping to the backend.
+ * Returns { ok: boolean, status: string }.
+ * Aborts after 5s to prevent promise pile-up on the ping interval.
+ */
+export const sendPing = async (userId, payload) => {
+  const result = await postLocationUpdate(userId, payload, 5000);
+  if (result.status) {
+    return { ok: false, status: result.status };
+  }
+
+  const res = result.response;
+  if (!res.ok) {
+    if (res.status === 429) return { ok: false, status: 'rate_limited' };
+    if (res.status >= 500) return { ok: false, status: 'server_error' };
+    return { ok: false, status: 'error' };
+  }
+
+  const data = await res.json();
+  return { ok: true, status: data.filtered ? 'filtered' : 'synced' };
 };
 
 /**

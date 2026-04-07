@@ -16,24 +16,28 @@ import * as Location from 'expo-location';
 import * as SecureStore from 'expo-secure-store';
 import * as IntentLauncher from 'expo-intent-launcher';
 
-import { BACKGROUND_TASK, GPS, STORAGE_KEY } from '../config/constants';
+import {
+  APP_STATE_KEY,
+  BACKGROUND_TASK,
+  GPS,
+  STORAGE_KEY,
+  TRACKING,
+  TRACKING_ACTIVE_KEY,
+} from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
 import { sendPing, sendStop } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
+import {
+  buildTrackingPayload,
+  createTrackingSession,
+  getActivityLabel,
+} from '../utils/trackingPayload';
 import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
 
-const TRACKING_ACTIVE_KEY = 'tracking_active';
-const APP_STATE_KEY = 'tracking_app_state';
-const STATIONARY_PING_COOLDOWN = 30_000;
-const PING_INTERVAL_MS = 3000;
 const MAX_LOGS = 50;
 const STATIONARY_SWITCH_THRESHOLD = 4;
-
-// If screen was off for longer than this, reset frontend GPS state
-// so the first point after resume is always accepted cleanly.
-const GAP_RESET_MS = 60_000; // 60 seconds
 
 export default function TrackingScreen({ user, onLogout }) {
   const userId = user.name || user.email || String(user.id);
@@ -44,6 +48,9 @@ export default function TrackingScreen({ user, onLogout }) {
   const [gpsAcc, setGpsAcc] = useState(null);
   const [totalDist, setTotalDist] = useState(0);
   const [serverStatus, setServerStatus] = useState('--');
+  const [sessionId, setSessionId] = useState(null);
+  const [lastSyncAt, setLastSyncAt] = useState(null);
+  const [trail, setTrail] = useState([]);
   const [debugLogs, setDebugLogs] = useState([]);
   const [showLogs, setShowLogs] = useState(false);
   const logScrollRef = useRef(null);
@@ -60,13 +67,13 @@ export default function TrackingScreen({ user, onLogout }) {
   const restartingGpsRef = useRef(false);
   const pingLoopActiveRef = useRef(false);
   const pingCountRef = useRef(0);
+  const sequenceRef = useRef(0);
   const stationaryCountRef = useRef(0);
   const justRestartedGpsRef = useRef(false);
+  const isStoppingRef = useRef(false);
 
-  // Track when screen went to background to detect long gaps
   const backgroundSinceRef = useRef(null);
 
-  // ── IN-APP LOGGER ──
   const addLog = useCallback((level, message) => {
     const time = new Date().toLocaleTimeString('en-US', { hour12: false });
     const entry = { time, level, message, id: Date.now() + Math.random() };
@@ -78,37 +85,35 @@ export default function TrackingScreen({ user, onLogout }) {
     setTimeout(() => logScrollRef.current?.scrollToEnd({ animated: false }), 50);
   }, []);
 
-  // ── APP STATE SYNC ──
   useEffect(() => {
     const syncAppState = async (state) => {
       try {
         await SecureStore.setItemAsync(
           APP_STATE_KEY,
-          state === 'active' ? 'foreground' : 'background'
+          state === 'active'
+            ? TRACKING.APP_STATE_FOREGROUND
+            : TRACKING.APP_STATE_BACKGROUND
         );
       } catch {}
 
       if (state === 'active') {
-        // Coming back from background — check if gap was long enough to reset
         const bgSince = backgroundSinceRef.current;
         const gapMs = bgSince ? Date.now() - bgSince : 0;
         backgroundSinceRef.current = null;
 
-        if (gapMs > GAP_RESET_MS) {
-          addLog('info', `AppState → active (gap=${(gapMs/1000).toFixed(0)}s) — resetting GPS state`);
-          // Reset frontend GPS state so next point is treated as fresh
+        if (gapMs > GPS.MAX_GAP_MS) {
+          addLog('info', `AppState -> active (gap=${(gapMs / 1000).toFixed(0)}s) -> resetting GPS state`);
           prevRef.current = null;
           kalmanRef.current.reset();
           windowRef.current.reset();
           stationaryCountRef.current = 0;
           justRestartedGpsRef.current = false;
         } else {
-          addLog('info', `AppState → active (gap=${(gapMs/1000).toFixed(0)}s)`);
+          addLog('info', `AppState -> active (gap=${(gapMs / 1000).toFixed(0)}s)`);
         }
       } else {
-        // Going to background — record when
         backgroundSinceRef.current = Date.now();
-        addLog('info', `AppState → ${state}`);
+        addLog('info', `AppState -> ${state}`);
       }
     };
 
@@ -117,11 +122,29 @@ export default function TrackingScreen({ user, onLogout }) {
     return () => subscription.remove();
   }, [addLog]);
 
-  const updateMap = (lat, lng) => {
-    mapRef.current?.postMessage(JSON.stringify({ t: 'loc', a: lat, o: lng }));
-  };
+  const updateMap = useCallback((lat, lng, accuracy, nextTrail) => {
+    mapRef.current?.postMessage(JSON.stringify({
+      t: 'state',
+      a: lat,
+      o: lng,
+      accuracy,
+      trail: nextTrail,
+    }));
+  }, []);
 
-  // ── DOZE MODE FIX ──
+  const pushTrailPoint = useCallback((point) => {
+    setTrail((prev) => {
+      const last = prev[prev.length - 1];
+      if (last && last.lat === point.lat && last.lng === point.lng) {
+        return prev;
+      }
+
+      const next = [...prev, point].slice(-TRACKING.TRAIL_LIMIT);
+      updateMap(point.lat, point.lng, point.accuracy, next);
+      return next;
+    });
+  }, [updateMap]);
+
   const requestBatteryExemption = async () => {
     if (Platform.OS !== 'android') return;
     try {
@@ -132,21 +155,20 @@ export default function TrackingScreen({ user, onLogout }) {
     } catch {}
   };
 
-  // ── SEQUENTIAL PING LOOP ──
   const runPingLoop = useCallback(async (userIdArg) => {
     pingLoopActiveRef.current = true;
     pingCountRef.current = 0;
     addLog('info', `Ping loop started for: ${userIdArg}`);
 
     while (pingLoopActiveRef.current) {
-      const r = latestPingRef.current;
+      const payload = latestPingRef.current;
 
-      if (r) {
+      if (payload) {
         let shouldSend = true;
 
-        if (!r.moving) {
+        if (!payload.moving) {
           const now = Date.now();
-          if (now - lastStationaryPingRef.current < STATIONARY_PING_COOLDOWN) {
+          if (now - lastStationaryPingRef.current < TRACKING.STATIONARY_PING_COOLDOWN_MS) {
             shouldSend = false;
           } else {
             lastStationaryPingRef.current = now;
@@ -159,20 +181,26 @@ export default function TrackingScreen({ user, onLogout }) {
           const pingNum = pingCountRef.current;
           const appState = AppState.currentState;
 
-          const result = await sendPing(userIdArg, r);
+          const result = await sendPing(userIdArg, payload);
 
           if (result.status === 'synced') {
             setServerStatus('Synced');
+            setLastSyncAt(Date.now());
           } else if (result.status === 'filtered') {
+            setServerStatus('Filtered');
+            setLastSyncAt(Date.now());
             addLog('info', `#${pingNum} filtered by backend`);
           } else if (result.status === 'rate_limited') {
             addLog('warn', `#${pingNum} rate limited`);
           } else if (result.status === 'server_error') {
             setServerStatus('Server Error');
-            addLog('error', `#${pingNum} SERVER ERROR | appState=${appState} | moving=${r.moving}`);
+            addLog('error', `#${pingNum} SERVER ERROR | appState=${appState} | moving=${payload.moving}`);
           } else if (result.status === 'offline') {
             setServerStatus('Offline');
-            addLog('error', `#${pingNum} OFFLINE | appState=${appState} | moving=${r.moving} | acc=${r.accuracy?.toFixed(0)}m | ts=${new Date(r.timestamp).toLocaleTimeString()}`);
+            addLog(
+              'error',
+              `#${pingNum} OFFLINE | appState=${appState} | moving=${payload.moving} | acc=${payload.accuracy?.toFixed(0)}m | ts=${new Date(payload.timestamp).toLocaleTimeString()}`
+            );
           } else {
             setServerStatus('Error');
             addLog('error', `#${pingNum} UNKNOWN status=${result.status} | appState=${appState}`);
@@ -180,15 +208,16 @@ export default function TrackingScreen({ user, onLogout }) {
         }
       }
 
-      await new Promise((resolve) => setTimeout(resolve, PING_INTERVAL_MS));
+      await new Promise((resolve) => setTimeout(resolve, TRACKING.PING_INTERVAL_MS));
     }
 
     addLog('info', `Ping loop stopped. Total: ${pingCountRef.current}`);
   }, [addLog]);
 
-  // ── START TRACKING ──
   const startTracking = useCallback(async () => {
     await SecureStore.setItemAsync(STORAGE_KEY, userId);
+    const existingSessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
+    const activeSessionId = existingSessionId || createTrackingSession(userId);
 
     const fg = await Location.requestForegroundPermissionsAsync();
     if (fg.status !== 'granted') return;
@@ -199,9 +228,13 @@ export default function TrackingScreen({ user, onLogout }) {
 
     setIsTracking(true);
     await SecureStore.setItemAsync(TRACKING_ACTIVE_KEY, 'true');
+    await SecureStore.setItemAsync(TRACKING.SESSION_KEY, activeSessionId);
     distRef.current = 0;
     setTotalDist(0);
     setServerStatus('--');
+    setSessionId(activeSessionId);
+    setLastSyncAt(null);
+    setTrail([]);
     lastStationaryPingRef.current = 0;
     setDebugLogs([]);
 
@@ -211,13 +244,12 @@ export default function TrackingScreen({ user, onLogout }) {
     restartingGpsRef.current = false;
     stationaryCountRef.current = 0;
     justRestartedGpsRef.current = false;
+    sequenceRef.current = 0;
     backgroundSinceRef.current = null;
 
-    addLog('info', 'Tracking started');
+    addLog('info', `Tracking started | session=${activeSessionId}`);
 
-    // ── GPS CALLBACK ──
     const onGpsUpdate = (loc) => {
-      // Grace period after GPS subscription restart
       if (justRestartedGpsRef.current) {
         justRestartedGpsRef.current = false;
         prevRef.current = null;
@@ -225,7 +257,7 @@ export default function TrackingScreen({ user, onLogout }) {
         windowRef.current.reset();
       }
 
-      const r = processLocation(
+      const processed = processLocation(
         loc,
         prevRef.current,
         kalmanRef.current,
@@ -233,32 +265,47 @@ export default function TrackingScreen({ user, onLogout }) {
         windowRef.current
       );
 
-      if (!r) {
-        addLog('warn', `GPS filtered | acc=${loc.coords.accuracy?.toFixed(1)}m`);
+      if (!processed) {
+        addLog('warn', `GPS filtered locally | acc=${loc.coords.accuracy?.toFixed(1)}m`);
         return;
       }
 
       prevRef.current = {
-        latitude: r.latitude,
-        longitude: r.longitude,
-        timestamp: r.timestamp,
+        latitude: processed.latitude,
+        longitude: processed.longitude,
+        timestamp: processed.timestamp,
       };
 
       if (AppState.currentState === 'active') {
-        setLocation({ latitude: r.latitude, longitude: r.longitude });
-        updateMap(r.latitude, r.longitude);
-        setSpeed(r.speed);
-        setGpsAcc(r.accuracy);
-        if (r.moving && r.distance > 0) {
-          distRef.current += r.distance;
+        setLocation({ latitude: processed.latitude, longitude: processed.longitude });
+        setSpeed(processed.speed);
+        setGpsAcc(processed.accuracy);
+        if (processed.moving && processed.distance > 0) {
+          distRef.current += processed.distance;
           setTotalDist(distRef.current);
         }
+        pushTrailPoint({
+          lat: processed.latitude,
+          lng: processed.longitude,
+          accuracy: processed.accuracy,
+        });
       }
 
-      latestPingRef.current = r;
+      sequenceRef.current += 1;
+      latestPingRef.current = buildTrackingPayload({
+        userId,
+        result: processed,
+        sessionId: activeSessionId,
+        sequence: sequenceRef.current,
+        source: 'foreground_watch',
+        appState:
+          AppState.currentState === 'active'
+            ? TRACKING.APP_STATE_FOREGROUND
+            : TRACKING.APP_STATE_BACKGROUND,
+        gpsIntervalMs: currentGpsIntervalRef.current,
+      });
 
-      // Hysteresis — don't switch interval until 4 consecutive stationary readings
-      if (r.moving) {
+      if (processed.moving) {
         stationaryCountRef.current = 0;
       } else {
         stationaryCountRef.current += 1;
@@ -276,7 +323,7 @@ export default function TrackingScreen({ user, onLogout }) {
         restartingGpsRef.current = true;
         currentGpsIntervalRef.current = desiredInterval;
         const oldSub = subRef.current;
-        addLog('info', `GPS interval → ${desiredInterval}ms (streak=${stationaryCountRef.current})`);
+        addLog('info', `GPS interval -> ${desiredInterval}ms (streak=${stationaryCountRef.current})`);
 
         Location.watchPositionAsync(
           {
@@ -296,8 +343,40 @@ export default function TrackingScreen({ user, onLogout }) {
             addLog('error', `GPS restart failed: ${err.message}`);
             restartingGpsRef.current = false;
           });
+    }
+  };
+
+  const stopNativeTracking = useCallback(async () => {
+    pingLoopActiveRef.current = false;
+    latestPingRef.current = null;
+    lastStationaryPingRef.current = 0;
+    stationaryCountRef.current = 0;
+    justRestartedGpsRef.current = false;
+    restartingGpsRef.current = false;
+    sequenceRef.current = 0;
+    backgroundSinceRef.current = null;
+
+    if (subRef.current) {
+      subRef.current.remove();
+      subRef.current = null;
+    }
+
+    try {
+      const running = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK);
+      if (running) {
+        await Location.stopLocationUpdatesAsync(BACKGROUND_TASK);
       }
-    };
+    } catch {}
+
+    await Promise.allSettled([
+      SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY),
+      SecureStore.deleteItemAsync(TRACKING.SESSION_KEY),
+      SecureStore.deleteItemAsync(STORAGE_KEY),
+      SecureStore.deleteItemAsync(APP_STATE_KEY),
+    ]);
+
+    resetBackgroundState();
+  }, []);
 
     currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
     const sub = await Location.watchPositionAsync(
@@ -316,7 +395,7 @@ export default function TrackingScreen({ user, onLogout }) {
 
     await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
       accuracy: Location.Accuracy.BestForNavigation,
-      timeInterval: 5000,
+      timeInterval: GPS.GPS_INTERVAL_BACKGROUND,
       distanceInterval: 10,
       showsBackgroundLocationIndicator: true,
       foregroundService: {
@@ -326,40 +405,27 @@ export default function TrackingScreen({ user, onLogout }) {
       },
     });
     addLog('info', 'Background task started');
-  }, [userId, runPingLoop, addLog]);
+  }, [addLog, pushTrailPoint, runPingLoop, userId]);
 
-  // ── STOP TRACKING ──
-  const stopTracking = async () => {
+  const stopTracking = useCallback(async () => {
+    if (isStoppingRef.current) return;
+    isStoppingRef.current = true;
+
     setIsTracking(false);
-    await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
-    setServerStatus('Stopped');
+    setServerStatus('Stopping...');
+    setSessionId(null);
+    addLog('info', `Stopping tracking. Pings sent: ${pingCountRef.current}`);
 
-    pingLoopActiveRef.current = false;
-    addLog('info', `Tracking stopped. Pings: ${pingCountRef.current}`);
-
-    stationaryCountRef.current = 0;
-    justRestartedGpsRef.current = false;
-    backgroundSinceRef.current = null;
-    latestPingRef.current = null;
-    lastStationaryPingRef.current = 0;
-    restartingGpsRef.current = false;
-
-    if (subRef.current) {
-      subRef.current.remove();
-      subRef.current = null;
+    try {
+      await stopNativeTracking();
+      setServerStatus('Stopped');
+      await sendStop(userId);
+      addLog('info', 'Tracking fully stopped');
+    } finally {
+      isStoppingRef.current = false;
     }
+  }, [addLog, stopNativeTracking, userId]);
 
-    await sendStop(userId);
-
-    const running = await Location.hasStartedLocationUpdatesAsync(BACKGROUND_TASK);
-    if (running) await Location.stopLocationUpdatesAsync(BACKGROUND_TASK);
-    await SecureStore.deleteItemAsync(STORAGE_KEY);
-    await SecureStore.deleteItemAsync(APP_STATE_KEY);
-
-    resetBackgroundState();
-  };
-
-  // ── INITIAL LOCATION + AUTO-RESUME ──
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -380,8 +446,10 @@ export default function TrackingScreen({ user, onLogout }) {
       if (cancelled) return;
       const c = loc.coords;
       if (c.latitude && c.longitude) {
+        const initialTrail = [{ lat: c.latitude, lng: c.longitude, accuracy: c.accuracy }];
         setLocation({ latitude: c.latitude, longitude: c.longitude });
         setGpsAcc(c.accuracy);
+        setTrail(initialTrail);
         prevRef.current = {
           latitude: c.latitude,
           longitude: c.longitude,
@@ -391,6 +459,8 @@ export default function TrackingScreen({ user, onLogout }) {
 
       const wasTracking = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
       if (wasTracking === 'true' && !cancelled) {
+        const savedSessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
+        if (savedSessionId) setSessionId(savedSessionId);
         addLog('info', 'Auto-resuming previous session');
         startTracking();
       }
@@ -400,10 +470,12 @@ export default function TrackingScreen({ user, onLogout }) {
       cancelled = true;
       pingLoopActiveRef.current = false;
       if (subRef.current) subRef.current.remove();
+      if (isTracking) {
+        void stopNativeTracking();
+      }
     };
-  }, [startTracking, addLog]);
+  }, [addLog, isTracking, startTracking, stopNativeTracking]);
 
-  // ── LOADING ──
   if (!location) {
     return (
       <SafeAreaView style={s.loadingWrap}>
@@ -420,11 +492,12 @@ export default function TrackingScreen({ user, onLogout }) {
       ? (totalDist / 1000).toFixed(2) + ' km'
       : Math.round(totalDist) + ' m';
   const accDisplay = gpsAcc ? gpsAcc.toFixed(0) + 'm' : '--';
-  const activity =
-    speed === 0 ? 'Stationary'
-    : speed * 3.6 < 5 ? 'Walking'
-    : speed * 3.6 < 20 ? 'Cycling'
-    : 'Driving';
+  const activity = getActivityLabel(speed);
+  const cadenceDisplay =
+    currentGpsIntervalRef.current >= GPS.GPS_INTERVAL_STATIONARY ? 'Idle cadence' : 'Live cadence';
+  const lastSyncDisplay = lastSyncAt
+    ? new Date(lastSyncAt).toLocaleTimeString('en-US', { hour12: false })
+    : '--';
 
   const logColor = (level) => {
     if (level === 'error') return '#ef4444';
@@ -472,19 +545,27 @@ export default function TrackingScreen({ user, onLogout }) {
           label="Server"
           value={serverStatus}
           valueColor={
-            serverStatus === 'Synced' ? '#16a34a'
-            : serverStatus === 'Rate Limited' || serverStatus === 'Server Error'
-              || serverStatus === 'Error' || serverStatus === 'Offline' ? '#dc2626'
-            : '#888'
+            serverStatus === 'Synced'
+              ? '#16a34a'
+              : serverStatus === 'Filtered'
+                ? '#d97706'
+              : serverStatus === 'Rate Limited' || serverStatus === 'Server Error'
+                || serverStatus === 'Error' || serverStatus === 'Offline'
+                ? '#dc2626'
+                : '#888'
           }
         />
+        <Row label="Last Sync" value={lastSyncDisplay} />
+        <Row label="Mode" value={cadenceDisplay} />
+        <Row label="Trail Points" value={String(trail.length)} />
+        <Row label="Session" value={sessionId ? sessionId.slice(0, 18) : '--'} />
       </View>
 
       <Pressable onPress={() => setShowLogs((v) => !v)} style={s.logToggle}>
         <Text style={s.logToggleText}>
-          {showLogs ? '▲ Hide Logs' : '▼ Debug Logs'} ({debugLogs.length})
+          {showLogs ? 'Hide Logs' : 'Debug Logs'} ({debugLogs.length})
         </Text>
-        {debugLogs.some((l) => l.level === 'error') && <View style={s.errorDot} />}
+        {debugLogs.some((entry) => entry.level === 'error') && <View style={s.errorDot} />}
       </Pressable>
 
       {showLogs && (
@@ -500,8 +581,7 @@ export default function TrackingScreen({ user, onLogout }) {
                   <Text key={entry.id} style={[s.logLine, { color: logColor(entry.level) }]}>
                     {entry.time} {entry.message}
                   </Text>
-                ))
-            }
+                ))}
           </ScrollView>
           <Pressable onPress={() => setDebugLogs([])} style={s.clearBtn}>
             <Text style={s.clearBtnText}>Clear</Text>

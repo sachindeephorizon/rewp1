@@ -1,21 +1,28 @@
 import * as TaskManager from 'expo-task-manager';
 import * as SecureStore from 'expo-secure-store';
-import { BACKGROUND_TASK, STORAGE_KEY, BACKEND_URL } from '../config/constants';
+import {
+  APP_STATE_KEY,
+  BACKGROUND_TASK,
+  GPS,
+  STORAGE_KEY,
+  TRACKING,
+} from '../config/constants';
+import { postLocationUpdate } from '../api/location';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
+import { buildTrackingPayload } from '../utils/trackingPayload';
 
-const APP_STATE_KEY = 'tracking_app_state';
-
-// Background state — managed exclusively by the background task.
-// Foreground must NEVER overwrite these.
+// Background state is managed only by the task.
 let bgPrev = null;
 const bgKalman = new KalmanFilter2D();
 const bgWindow = new SlidingWindow();
+let bgSequence = 0;
 
 export const resetBackgroundState = () => {
   bgPrev = null;
   bgKalman.reset();
   bgWindow.reset();
+  bgSequence = 0;
 };
 
 TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
@@ -24,10 +31,10 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
   try {
     const userId = await SecureStore.getItemAsync(STORAGE_KEY);
     const appState = await SecureStore.getItemAsync(APP_STATE_KEY);
+    const sessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
     const loc = data.locations?.[0];
 
-    // Skip if no user, no location, or foreground is already handling it
-    if (!userId || !loc || appState === 'foreground') return;
+    if (!userId || !loc || appState === TRACKING.APP_STATE_FOREGROUND) return;
 
     const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
     if (!result) return;
@@ -38,28 +45,18 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
       timestamp: result.timestamp,
     };
 
-    // Abort fetch if it hangs — prevents OS from killing the task
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
+    bgSequence += 1;
+    const payload = buildTrackingPayload({
+      userId,
+      result,
+      sessionId,
+      sequence: bgSequence,
+      source: 'background_task',
+      appState: appState || TRACKING.APP_STATE_BACKGROUND,
+      gpsIntervalMs: GPS.GPS_INTERVAL_BACKGROUND,
+    });
 
-    try {
-      await fetch(`${BACKEND_URL}/${userId}/ping`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          lat: result.latitude,
-          lng: result.longitude,
-          speed: result.speed,
-          accuracy: result.accuracy,
-          timestamp: result.timestamp,
-        }),
-        signal: controller.signal,
-      });
-    } catch {
-      // Network error or aborted — next task run will retry
-    } finally {
-      clearTimeout(timeout);
-    }
+    await postLocationUpdate(userId, payload, 8000);
   } catch (err) {
     console.error('Background sync failed:', err);
   }

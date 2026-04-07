@@ -55,7 +55,7 @@ export { SlidingWindow };
  * @param {SlidingWindow|null} window - ignored, kept for API compatibility
  */
 export const processLocation = (loc, prev, kalman, accelStationary = false, window = null) => {
-  const { latitude, longitude, accuracy } = loc.coords;
+  const { latitude, longitude, accuracy, heading } = loc.coords;
   const ts = loc.timestamp;
 
   if (!accuracy || accuracy > GPS.MAX_ACCURACY) return null;
@@ -87,6 +87,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
         longitude: prev.longitude,
         speed: 0,
         accuracy,
+        heading: typeof heading === 'number' && heading >= 0 ? heading : null,
         timestamp: ts,
         distance: 0,
         moving: false,
@@ -104,6 +105,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
       longitude: filtered[1],
       speed: speed < GPS.MIN_SPEED ? 0 : speed,
       accuracy,
+      heading: typeof heading === 'number' && heading >= 0 ? heading : null,
       timestamp: ts,
       distance: filteredDist,
       moving: true,
@@ -118,6 +120,7 @@ export const processLocation = (loc, prev, kalman, accelStationary = false, wind
     longitude,
     speed: 0,
     accuracy,
+    heading: typeof heading === 'number' && heading >= 0 ? heading : null,
     timestamp: ts,
     distance: 0,
     moving: false,

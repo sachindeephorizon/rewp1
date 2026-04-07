@@ -1,4 +1,4 @@
-export const BACKEND_URL = 'http://192.168.0.187:9001';
+export const BACKEND_URL = 'https://rewp2-production.up.railway.app';
 export const BACKGROUND_TASK = 'background-location-task';
 export const STORAGE_KEY = 'activeUserId';
 export const TRACKING_ACTIVE_KEY = 'tracking_active';

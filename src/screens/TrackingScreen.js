@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   AppState,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -20,6 +21,8 @@ import {
   APP_STATE_KEY,
   BACKGROUND_TASK,
   GPS,
+  NAV_DESTINATION_KEY,
+  NAV_ROUTE_KEY,
   STORAGE_KEY,
   TRACKING,
   TRACKING_ACTIVE_KEY,
@@ -36,6 +39,15 @@ import {
 } from '../utils/trackingPayload';
 import MiniMap from '../components/MiniMap';
 import Row from '../components/Row';
+import RouteScreen from './RouteScreen';
+import {
+  haversineMeters,
+  snapToRoute,
+  sliceRouteFrom,
+  routeLengthMeters,
+  formatDistanceMeters,
+} from '../utils/geo';
+import { fetchOsrmRoute } from '../api/routing';
 
 const MAX_LOGS = 50;
 const STATIONARY_SWITCH_THRESHOLD = 4;
@@ -54,6 +66,13 @@ export default function TrackingScreen({ user, onLogout }) {
   const [trail, setTrail] = useState([]);
   const [debugLogs, setDebugLogs] = useState([]);
   const [showLogs, setShowLogs] = useState(false);
+  const [showRoute, setShowRoute] = useState(false);
+  const [destination, setDestination] = useState(null);   // { lat, lng, name }
+  const [routePath, setRoutePath] = useState(null);       // full original route
+  const [remainingRoute, setRemainingRoute] = useState(null); // shrinks as user moves
+  const [rerouting, setRerouting] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+  const refreshingRef = useRef(false);
   const logScrollRef = useRef(null);
 
   const prevRef = useRef(null);
@@ -72,6 +91,12 @@ export default function TrackingScreen({ user, onLogout }) {
   const stationaryCountRef = useRef(0);
   const justRestartedGpsRef = useRef(false);
   const isStoppingRef = useRef(false);
+
+  // Navigation refs (only used when a destination is set)
+  const lastSegmentIndexRef = useRef(0);
+  const offRouteCountRef = useRef(0);
+  const arrivalCountRef = useRef(0);
+  const reroutingRef = useRef(false);
 
   const backgroundSinceRef = useRef(null);
 
@@ -104,6 +129,30 @@ export default function TrackingScreen({ user, onLogout }) {
   const persistDistance = useCallback(async (value) => {
     try {
       await SecureStore.setItemAsync(TRACKING_TOTAL_DISTANCE_KEY, String(value));
+    } catch {}
+  }, []);
+
+  // Persist destination + route so navigation state survives a process kill.
+  // Reading them back happens in the bootstrap effect below.
+  const persistNavState = useCallback(async (dest, routeArr) => {
+    try {
+      if (dest) {
+        await SecureStore.setItemAsync(NAV_DESTINATION_KEY, JSON.stringify(dest));
+      } else {
+        await SecureStore.deleteItemAsync(NAV_DESTINATION_KEY);
+      }
+      if (routeArr && routeArr.length) {
+        await SecureStore.setItemAsync(NAV_ROUTE_KEY, JSON.stringify(routeArr));
+      } else {
+        await SecureStore.deleteItemAsync(NAV_ROUTE_KEY);
+      }
+    } catch {}
+  }, []);
+
+  const clearPersistedNavState = useCallback(async () => {
+    try {
+      await SecureStore.deleteItemAsync(NAV_DESTINATION_KEY);
+      await SecureStore.deleteItemAsync(NAV_ROUTE_KEY);
     } catch {}
   }, []);
 
@@ -475,6 +524,159 @@ export default function TrackingScreen({ user, onLogout }) {
     }
   }, [addLog, stopNativeTracking, userId]);
 
+  // ────────────────────────────────────────────────────────────────────────
+  // Manual refresh: pulls a fresh GPS fix, refreshes the persisted distance,
+  // and (if tracking) immediately pushes the current position to the backend
+  // — bypassing the ping loop's normal cadence. Does NOT touch the GPS
+  // watcher, Kalman filter, or background task.
+  // ────────────────────────────────────────────────────────────────────────
+  const handleRefresh = useCallback(async () => {
+    if (refreshingRef.current) return;
+    refreshingRef.current = true;
+    setRefreshing(true);
+    addLog('info', 'Manual refresh requested');
+
+    try {
+      // 1. Re-read persisted total distance from secure storage.
+      await loadPersistedDistance();
+
+      // 2. Force a fresh, high-accuracy GPS fix for the display.
+      const loc = await Location.getCurrentPositionAsync({
+        accuracy: Location.Accuracy.BestForNavigation,
+      });
+      const c = loc?.coords;
+      if (!c || !Number.isFinite(c.latitude) || !Number.isFinite(c.longitude)) {
+        addLog('warn', 'Refresh: no valid GPS coords returned');
+        return;
+      }
+
+      const speedVal = Number.isFinite(c.speed) && c.speed >= 0 ? c.speed : 0;
+      setLocation({ latitude: c.latitude, longitude: c.longitude });
+      setGpsAcc(c.accuracy);
+      setSpeed(speedVal);
+
+      addLog(
+        'info',
+        `Refresh GPS: ${c.latitude.toFixed(5)}, ${c.longitude.toFixed(5)} | acc=${c.accuracy?.toFixed(0)}m`
+      );
+
+      // 3. If currently tracking, send this fix to the backend right now.
+      if (isTracking) {
+        sequenceRef.current += 1;
+        const payload = buildTrackingPayload({
+          userId,
+          result: {
+            latitude: c.latitude,
+            longitude: c.longitude,
+            accuracy: c.accuracy,
+            speed: speedVal,
+            heading: c.heading,
+            moving: speedVal > 0.5,
+            distance: 0, // refresh doesn't add to total distance
+            timestamp: loc.timestamp || Date.now(),
+          },
+          sessionId,
+          sequence: sequenceRef.current,
+          source: 'manual_refresh',
+          appState:
+            AppState.currentState === 'active'
+              ? TRACKING.APP_STATE_FOREGROUND
+              : TRACKING.APP_STATE_BACKGROUND,
+          gpsIntervalMs: currentGpsIntervalRef.current,
+        });
+
+        const result = await sendPing(userId, payload);
+        if (result.status === 'synced') {
+          setServerStatus('Synced');
+          setLastSyncAt(Date.now());
+          addLog('info', 'Refresh ping synced');
+        } else if (result.status === 'filtered') {
+          setServerStatus('Filtered');
+          setLastSyncAt(Date.now());
+          addLog('info', 'Refresh ping filtered by backend');
+        } else {
+          addLog('warn', `Refresh ping status: ${result.status}`);
+        }
+      }
+    } catch (e) {
+      addLog('error', `Refresh failed: ${e.message}`);
+    } finally {
+      refreshingRef.current = false;
+      setRefreshing(false);
+    }
+  }, [addLog, isTracking, loadPersistedDistance, sessionId, userId]);
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Navigation effect: snap-to-route, shrinking polyline, off-route reroute,
+  // and auto-stop on arrival. Inert when no destination is set, so the rest
+  // of the tracking flow is unaffected.
+  // ────────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isTracking || !destination || !routePath || !location) return;
+
+    const cur = { lat: location.latitude, lng: location.longitude };
+
+    // 1. Arrival check (with 2-reading hysteresis to swallow GPS spikes)
+    const distToDest = haversineMeters(cur, destination);
+    if (distToDest < 100) {
+      arrivalCountRef.current += 1;
+      if (arrivalCountRef.current >= 2) {
+        addLog('info', `Arrived at destination (${distToDest.toFixed(0)}m). Auto-stopping.`);
+        arrivalCountRef.current = 0;
+        offRouteCountRef.current = 0;
+        lastSegmentIndexRef.current = 0;
+        setDestination(null);
+        setRoutePath(null);
+        setRemainingRoute(null);
+        void clearPersistedNavState();
+        void stopTracking();
+      }
+      return;
+    }
+    arrivalCountRef.current = 0;
+
+    // 2. Snap current location onto the route. Allow a tiny look-back so GPS
+    //    jitter near a segment boundary doesn't get pinned to the wrong side,
+    //    but never search the whole route from the start (prevents the line
+    //    from "growing back" if the user briefly zig-zags).
+    const fromIdx = Math.max(0, lastSegmentIndexRef.current - 2);
+    const snap = snapToRoute(cur, routePath, fromIdx);
+    if (!snap) return;
+
+    // 3. Off-route detection — 3 consecutive readings >50m from the polyline
+    //    triggers a re-route from the current location.
+    if (snap.distance > 50) {
+      offRouteCountRef.current += 1;
+      if (offRouteCountRef.current >= 3 && !reroutingRef.current) {
+        reroutingRef.current = true;
+        setRerouting(true);
+        addLog('warn', `Off-route by ${snap.distance.toFixed(0)}m — re-routing…`);
+        fetchOsrmRoute(cur, destination)
+          .then(({ route: newRoute }) => {
+            lastSegmentIndexRef.current = 0;
+            offRouteCountRef.current = 0;
+            setRoutePath(newRoute);
+            setRemainingRoute(newRoute);
+            void persistNavState(destination, newRoute);
+            addLog('info', `Re-routed (${newRoute.length} pts)`);
+          })
+          .catch((err) => {
+            addLog('error', `Re-route failed: ${err.message}`);
+          })
+          .finally(() => {
+            reroutingRef.current = false;
+            setRerouting(false);
+          });
+      }
+      return;
+    }
+
+    // 4. On-route — advance the segment index and shrink the displayed line.
+    offRouteCountRef.current = 0;
+    lastSegmentIndexRef.current = snap.segmentIndex;
+    setRemainingRoute(sliceRouteFrom(routePath, snap.segmentIndex, snap.point));
+  }, [location, destination, routePath, isTracking, addLog, stopTracking]);
+
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -504,6 +706,31 @@ export default function TrackingScreen({ user, onLogout }) {
           longitude: c.longitude,
           timestamp: loc.timestamp,
         };
+      }
+
+      // Re-hydrate any previously persisted destination + route, so navigation
+      // state survives a process kill. The navigation effect will then catch
+      // up against the user's current location on the next GPS tick.
+      try {
+        const [destRaw, routeRaw] = await Promise.all([
+          SecureStore.getItemAsync(NAV_DESTINATION_KEY),
+          SecureStore.getItemAsync(NAV_ROUTE_KEY),
+        ]);
+        if (!cancelled && destRaw) {
+          const savedDest = JSON.parse(destRaw);
+          const savedRoute = routeRaw ? JSON.parse(routeRaw) : null;
+          setDestination(savedDest);
+          if (savedRoute && Array.isArray(savedRoute) && savedRoute.length > 1) {
+            setRoutePath(savedRoute);
+            setRemainingRoute(savedRoute);
+          }
+          lastSegmentIndexRef.current = 0;
+          offRouteCountRef.current = 0;
+          arrivalCountRef.current = 0;
+          addLog('info', `Restored destination: ${savedDest.name || 'unnamed'}`);
+        }
+      } catch (e) {
+        addLog('warn', `Failed to restore nav state: ${e.message}`);
       }
 
       const wasTracking = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
@@ -566,11 +793,25 @@ export default function TrackingScreen({ user, onLogout }) {
           <Text style={s.headerTitle}>{user.name || 'Deep Horizon'}</Text>
           <Text style={s.headerUser}>{user.email}</Text>
         </View>
-        <View style={[s.badge, isTracking ? s.badgeOn : s.badgeOff]}>
-          <View style={[s.dot, isTracking ? s.dotOn : s.dotOff]} />
-          <Text style={[s.badgeText, isTracking ? s.badgeTextOn : s.badgeTextOff]}>
-            {isTracking ? 'LIVE' : 'OFFLINE'}
-          </Text>
+        <View style={s.headerRight}>
+          <Pressable
+            onPress={handleRefresh}
+            disabled={refreshing}
+            style={[s.refreshBtn, refreshing && s.refreshBtnDisabled]}
+            hitSlop={8}
+          >
+            {refreshing ? (
+              <ActivityIndicator size="small" color="#2563EB" />
+            ) : (
+              <Text style={s.refreshBtnText}>↻</Text>
+            )}
+          </Pressable>
+          <View style={[s.badge, isTracking ? s.badgeOn : s.badgeOff]}>
+            <View style={[s.dot, isTracking ? s.dotOn : s.dotOff]} />
+            <Text style={[s.badgeText, isTracking ? s.badgeTextOn : s.badgeTextOff]}>
+              {isTracking ? 'LIVE' : 'OFFLINE'}
+            </Text>
+          </View>
         </View>
       </View>
 
@@ -591,7 +832,46 @@ export default function TrackingScreen({ user, onLogout }) {
         </View>
       </View>
 
-      <MiniMap ref={mapRef} latitude={location.latitude} longitude={location.longitude} />
+      <MiniMap
+        ref={mapRef}
+        latitude={location.latitude}
+        longitude={location.longitude}
+        destination={destination}
+        route={remainingRoute || routePath}
+      />
+
+      {destination && (
+        <View style={s.destBanner}>
+          <View style={{ flex: 1 }}>
+            <Text style={s.destBannerLabel}>
+              {rerouting ? 'Re-routing…' : isTracking ? 'Following Route' : 'Destination'}
+            </Text>
+            <Text style={s.destBannerText} numberOfLines={1}>
+              {destination.name || `${destination.lat.toFixed(5)}, ${destination.lng.toFixed(5)}`}
+            </Text>
+            {remainingRoute && remainingRoute.length > 1 && (
+              <Text style={s.destBannerMeta}>
+                {formatDistanceMeters(routeLengthMeters(remainingRoute))} remaining
+              </Text>
+            )}
+          </View>
+          <Pressable
+            onPress={() => {
+              setDestination(null);
+              setRoutePath(null);
+              setRemainingRoute(null);
+              lastSegmentIndexRef.current = 0;
+              offRouteCountRef.current = 0;
+              arrivalCountRef.current = 0;
+              void clearPersistedNavState();
+            }}
+            style={s.destBannerClear}
+          >
+            <Text style={s.destBannerClearText}>Clear</Text>
+          </Pressable>
+        </View>
+      )}
+    {user.email === 'sachin@gmail.com' && (
 
       <View style={s.infoCard}>
         <Row label="Position" value={`${location.latitude.toFixed(6)}, ${location.longitude.toFixed(6)}`} />
@@ -615,12 +895,17 @@ export default function TrackingScreen({ user, onLogout }) {
         <Row label="Session" value={sessionId ? sessionId.slice(0, 18) : '--'} />
       </View>
 
-      <Pressable onPress={() => setShowLogs((v) => !v)} style={s.logToggle}>
-        <Text style={s.logToggleText}>
-          {showLogs ? 'Hide Logs' : 'Debug Logs'} ({debugLogs.length})
-        </Text>
-        {debugLogs.some((entry) => entry.level === 'error') && <View style={s.errorDot} />}
-      </Pressable>
+    )}
+      
+
+      {user.email === 'sachin@gmail.com' && (
+        <Pressable onPress={() => setShowLogs((v) => !v)} style={s.logToggle}>
+          <Text style={s.logToggleText}>
+            {showLogs ? 'Hide Logs' : 'Debug Logs'} ({debugLogs.length})
+          </Text>
+          {debugLogs.some((entry) => entry.level === 'error') && <View style={s.errorDot} />}
+        </Pressable>
+      )}
 
       {showLogs && (
         <View style={s.logPanel}>
@@ -654,11 +939,38 @@ export default function TrackingScreen({ user, onLogout }) {
             <Text style={s.btnTextWhite}>Stop Tracking</Text>
           </Pressable>
         )}
+        {!isTracking && (
+          <Pressable style={s.btnDestination} onPress={() => setShowRoute(true)}>
+            <Text style={s.btnDestinationText}>Add Destination</Text>
+          </Pressable>
+        )}
         <Pressable style={s.btnLogout} onPress={onLogout}>
           <Text style={s.btnLogoutText}>Logout</Text>
         </Pressable>
       </View>
       </ScrollView>
+
+      <Modal
+        visible={showRoute}
+        animationType="slide"
+        presentationStyle="fullScreen"
+        onRequestClose={() => setShowRoute(false)}
+      >
+        <RouteScreen
+          origin={{ lat: location.latitude, lng: location.longitude }}
+          initialDestination={destination}
+          onClose={() => setShowRoute(false)}
+          onConfirm={({ destination: dest, route: rt }) => {
+            setDestination(dest);
+            setRoutePath(rt);
+            setRemainingRoute(rt);
+            lastSegmentIndexRef.current = 0;
+            offRouteCountRef.current = 0;
+            arrivalCountRef.current = 0;
+            void persistNavState(dest, rt);
+          }}
+        />
+      </Modal>
 
       <StatusBar style="dark" />
     </SafeAreaView>
@@ -675,6 +987,10 @@ const s = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingTop: 10, paddingBottom: 6 },
   headerTitle: { fontSize: 18, fontWeight: '800', color: '#0F172A' },
   headerUser: { fontSize: 12, color: '#64748B', marginTop: 1 },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  refreshBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: '#EFF6FF', borderWidth: 1, borderColor: '#BFDBFE', alignItems: 'center', justifyContent: 'center' },
+  refreshBtnDisabled: { opacity: 0.5 },
+  refreshBtnText: { fontSize: 18, color: '#2563EB', fontWeight: '700', lineHeight: 20 },
   badge: { flexDirection: 'row', alignItems: 'center', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 20 },
   badgeOn: { backgroundColor: 'rgba(22,163,74,0.1)' },
   badgeOff: { backgroundColor: 'rgba(239,68,68,0.1)' },
@@ -705,6 +1021,14 @@ const s = StyleSheet.create({
   actions: { marginTop: 'auto', paddingBottom: 32 },
   btnTrack: { backgroundColor: '#0F172A', paddingVertical: 14, borderRadius: 10, alignItems: 'center' },
   btnStop: { backgroundColor: '#EF4444', paddingVertical: 14, borderRadius: 10, alignItems: 'center' },
+  btnDestination: { marginTop: 8, backgroundColor: '#2563EB', paddingVertical: 12, borderRadius: 10, alignItems: 'center' },
+  btnDestinationText: { color: '#FFF', fontSize: 14, fontWeight: '700' },
+  destBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#EFF6FF', borderWidth: 1, borderColor: '#BFDBFE', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 8, marginBottom: 8 },
+  destBannerLabel: { fontSize: 9, fontWeight: '700', color: '#2563EB', textTransform: 'uppercase', letterSpacing: 0.5 },
+  destBannerText: { fontSize: 12, fontWeight: '700', color: '#0F172A', marginTop: 1 },
+  destBannerMeta: { fontSize: 11, fontWeight: '600', color: '#2563EB', marginTop: 2 },
+  destBannerClear: { backgroundColor: '#FEE2E2', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6 },
+  destBannerClearText: { fontSize: 11, fontWeight: '700', color: '#DC2626' },
   btnTextWhite: { color: '#FFF', fontSize: 15, fontWeight: '700' },
   btnLogout: { marginTop: 8, paddingVertical: 10, alignItems: 'center' },
   btnLogoutText: { color: '#64748B', fontSize: 14, fontWeight: '600' },

@@ -6,6 +6,8 @@ import {
   GPS,
   STORAGE_KEY,
   TRACKING,
+  TRACKING_ACTIVE_KEY,
+  TRACKING_TOTAL_DISTANCE_KEY,
 } from '../config/constants';
 import { postLocationUpdate } from '../api/location';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
@@ -30,11 +32,12 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
 
   try {
     const userId = await SecureStore.getItemAsync(STORAGE_KEY);
+    const trackingActive = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
     const appState = await SecureStore.getItemAsync(APP_STATE_KEY);
     const sessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
     const loc = data.locations?.[0];
 
-    if (!userId || !loc || appState === TRACKING.APP_STATE_FOREGROUND) return;
+    if (trackingActive !== 'true' || !userId || !loc) return;
 
     const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
     if (!result) return;
@@ -46,6 +49,16 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
     };
 
     bgSequence += 1;
+
+    if (result.moving && result.distance > 0) {
+      const currentDistanceRaw = await SecureStore.getItemAsync(TRACKING_TOTAL_DISTANCE_KEY);
+      const currentDistance = currentDistanceRaw ? Number(currentDistanceRaw) : 0;
+      const safeCurrentDistance =
+        Number.isFinite(currentDistance) && currentDistance >= 0 ? currentDistance : 0;
+      const nextDistance = safeCurrentDistance + result.distance;
+      await SecureStore.setItemAsync(TRACKING_TOTAL_DISTANCE_KEY, String(nextDistance));
+    }
+
     const payload = buildTrackingPayload({
       userId,
       result,

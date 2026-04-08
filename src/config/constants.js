@@ -3,6 +3,9 @@ export const BACKGROUND_TASK = 'background-location-task';
 export const STORAGE_KEY = 'activeUserId';
 export const TRACKING_ACTIVE_KEY = 'tracking_active';
 export const APP_STATE_KEY = 'tracking_app_state';
+export const TRACKING_TOTAL_DISTANCE_KEY = 'tracking_total_distance_m';
+export const NAV_DESTINATION_KEY = 'nav_destination';
+export const NAV_ROUTE_KEY = 'nav_route';
 
 export const GPS = {
   MAX_ACCURACY: 35,

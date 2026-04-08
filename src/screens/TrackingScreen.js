@@ -23,6 +23,7 @@ import {
   STORAGE_KEY,
   TRACKING,
   TRACKING_ACTIVE_KEY,
+  TRACKING_TOTAL_DISTANCE_KEY,
 } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
@@ -85,6 +86,27 @@ export default function TrackingScreen({ user, onLogout }) {
     setTimeout(() => logScrollRef.current?.scrollToEnd({ animated: false }), 50);
   }, []);
 
+  const loadPersistedDistance = useCallback(async () => {
+    try {
+      const raw = await SecureStore.getItemAsync(TRACKING_TOTAL_DISTANCE_KEY);
+      const parsed = raw ? Number(raw) : 0;
+      const safeDistance = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+      distRef.current = safeDistance;
+      setTotalDist(safeDistance);
+      return safeDistance;
+    } catch {
+      distRef.current = 0;
+      setTotalDist(0);
+      return 0;
+    }
+  }, []);
+
+  const persistDistance = useCallback(async (value) => {
+    try {
+      await SecureStore.setItemAsync(TRACKING_TOTAL_DISTANCE_KEY, String(value));
+    } catch {}
+  }, []);
+
   useEffect(() => {
     const syncAppState = async (state) => {
       try {
@@ -100,6 +122,11 @@ export default function TrackingScreen({ user, onLogout }) {
         const bgSince = backgroundSinceRef.current;
         const gapMs = bgSince ? Date.now() - bgSince : 0;
         backgroundSinceRef.current = null;
+
+        const trackingActive = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
+        if (trackingActive === 'true') {
+          await loadPersistedDistance();
+        }
 
         if (gapMs > GPS.MAX_GAP_MS) {
           addLog('info', `AppState -> active (gap=${(gapMs / 1000).toFixed(0)}s) -> resetting GPS state`);
@@ -120,7 +147,7 @@ export default function TrackingScreen({ user, onLogout }) {
     syncAppState(AppState.currentState);
     const subscription = AppState.addEventListener('change', syncAppState);
     return () => subscription.remove();
-  }, [addLog]);
+  }, [addLog, loadPersistedDistance]);
 
   const updateMap = useCallback((lat, lng, accuracy, nextTrail) => {
     mapRef.current?.postMessage(JSON.stringify({
@@ -216,21 +243,34 @@ export default function TrackingScreen({ user, onLogout }) {
 
   const startTracking = useCallback(async () => {
     await SecureStore.setItemAsync(STORAGE_KEY, userId);
+    const wasTrackingBefore = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
     const existingSessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
+    const isResume = wasTrackingBefore === 'true' && Boolean(existingSessionId);
     const activeSessionId = existingSessionId || createTrackingSession(userId);
 
     const fg = await Location.requestForegroundPermissionsAsync();
-    if (fg.status !== 'granted') return;
+    if (fg.status !== 'granted') {
+      addLog('error', 'Foreground location permission denied');
+      return;
+    }
+
     const bg = await Location.requestBackgroundPermissionsAsync();
-    if (bg.status !== 'granted') addLog('warn', 'Background permission denied');
+    if (bg.status !== 'granted') {
+      addLog('warn', 'Background permission denied. Enable "Allow all the time" in app settings.');
+    }
 
     await requestBatteryExemption();
 
     setIsTracking(true);
     await SecureStore.setItemAsync(TRACKING_ACTIVE_KEY, 'true');
     await SecureStore.setItemAsync(TRACKING.SESSION_KEY, activeSessionId);
-    distRef.current = 0;
-    setTotalDist(0);
+    if (isResume) {
+      await loadPersistedDistance();
+    } else {
+      distRef.current = 0;
+      setTotalDist(0);
+      await persistDistance(0);
+    }
     setServerStatus('--');
     setSessionId(activeSessionId);
     setLastSyncAt(null);
@@ -281,8 +321,10 @@ export default function TrackingScreen({ user, onLogout }) {
         setSpeed(processed.speed);
         setGpsAcc(processed.accuracy);
         if (processed.moving && processed.distance > 0) {
-          distRef.current += processed.distance;
-          setTotalDist(distRef.current);
+          const nextDistance = distRef.current + processed.distance;
+          distRef.current = nextDistance;
+          setTotalDist(nextDistance);
+          void persistDistance(nextDistance);
         }
         pushTrailPoint({
           lat: processed.latitude,
@@ -343,8 +385,43 @@ export default function TrackingScreen({ user, onLogout }) {
             addLog('error', `GPS restart failed: ${err.message}`);
             restartingGpsRef.current = false;
           });
+      }
+    };
+
+    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
+    const sub = await Location.watchPositionAsync(
+      {
+        accuracy: Location.Accuracy.BestForNavigation,
+        timeInterval: GPS.GPS_INTERVAL_MOVING,
+        distanceInterval: 0,
+      },
+      onGpsUpdate
+    );
+    subRef.current = sub;
+    addLog('info', 'GPS watcher started');
+
+    latestPingRef.current = null;
+    runPingLoop(userId);
+
+    if (bg.status === 'granted') {
+      try {
+        await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: GPS.GPS_INTERVAL_BACKGROUND,
+          distanceInterval: 0,
+          showsBackgroundLocationIndicator: true,
+          foregroundService: {
+            notificationTitle: 'Live Tracking Active',
+            notificationBody: `Tracking ${userId}`,
+            notificationColor: '#2563EB',
+          },
+        });
+        addLog('info', 'Background task started');
+      } catch (err) {
+        addLog('error', `Background task failed: ${err.message}`);
+      }
     }
-  };
+  }, [addLog, loadPersistedDistance, persistDistance, pushTrailPoint, runPingLoop, userId]);
 
   const stopNativeTracking = useCallback(async () => {
     pingLoopActiveRef.current = false;
@@ -373,39 +450,11 @@ export default function TrackingScreen({ user, onLogout }) {
       SecureStore.deleteItemAsync(TRACKING.SESSION_KEY),
       SecureStore.deleteItemAsync(STORAGE_KEY),
       SecureStore.deleteItemAsync(APP_STATE_KEY),
+      SecureStore.deleteItemAsync(TRACKING_TOTAL_DISTANCE_KEY),
     ]);
 
     resetBackgroundState();
   }, []);
-
-    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
-    const sub = await Location.watchPositionAsync(
-      {
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: GPS.GPS_INTERVAL_MOVING,
-        distanceInterval: 0,
-      },
-      onGpsUpdate
-    );
-    subRef.current = sub;
-    addLog('info', 'GPS watcher started');
-
-    latestPingRef.current = null;
-    runPingLoop(userId);
-
-    await Location.startLocationUpdatesAsync(BACKGROUND_TASK, {
-      accuracy: Location.Accuracy.BestForNavigation,
-      timeInterval: GPS.GPS_INTERVAL_BACKGROUND,
-      distanceInterval: 10,
-      showsBackgroundLocationIndicator: true,
-      foregroundService: {
-        notificationTitle: 'Live Tracking Active',
-        notificationBody: `Tracking ${userId}`,
-        notificationColor: '#2563EB',
-      },
-    });
-    addLog('info', 'Background task started');
-  }, [addLog, pushTrailPoint, runPingLoop, userId]);
 
   const stopTracking = useCallback(async () => {
     if (isStoppingRef.current) return;
@@ -507,6 +556,11 @@ export default function TrackingScreen({ user, onLogout }) {
 
   return (
     <SafeAreaView style={s.container}>
+      <ScrollView
+        style={s.screenScroll}
+        contentContainerStyle={s.screenContent}
+        showsVerticalScrollIndicator={false}
+      >
       <View style={s.header}>
         <View>
           <Text style={s.headerTitle}>{user.name || 'Deep Horizon'}</Text>
@@ -573,6 +627,7 @@ export default function TrackingScreen({ user, onLogout }) {
           <ScrollView
             ref={logScrollRef}
             style={s.logScroll}
+            nestedScrollEnabled
             onContentSizeChange={() => logScrollRef.current?.scrollToEnd({ animated: false })}
           >
             {debugLogs.length === 0
@@ -603,6 +658,7 @@ export default function TrackingScreen({ user, onLogout }) {
           <Text style={s.btnLogoutText}>Logout</Text>
         </Pressable>
       </View>
+      </ScrollView>
 
       <StatusBar style="dark" />
     </SafeAreaView>
@@ -611,6 +667,8 @@ export default function TrackingScreen({ user, onLogout }) {
 
 const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#F8FAFC', paddingHorizontal: 20, paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0 },
+  screenScroll: { flex: 1 },
+  screenContent: { flexGrow: 1, paddingBottom: 20 },
   loadingWrap: { flex: 1, backgroundColor: '#F8FAFC', justifyContent: 'center', alignItems: 'center', paddingTop: Platform.OS === 'android' ? RNStatusBar.currentHeight : 0 },
   loadingText: { fontSize: 18, fontWeight: '700', color: '#1E293B', marginTop: 20 },
   loadingSub: { fontSize: 13, color: '#94A3B8', marginTop: 6 },

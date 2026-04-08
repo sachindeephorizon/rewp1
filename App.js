@@ -4,7 +4,12 @@ import * as SecureStore from 'expo-secure-store';
 import LoginScreen from './src/screens/LoginScreen';
 import TrackingScreen from './src/screens/TrackingScreen';
 import { getMe } from './src/api/auth';
-import { STORAGE_KEY, TRACKING, TRACKING_ACTIVE_KEY } from './src/config/constants';
+import {
+  STORAGE_KEY,
+  TRACKING,
+  TRACKING_ACTIVE_KEY,
+  TRACKING_TOTAL_DISTANCE_KEY,
+} from './src/config/constants';
 
 const AUTH_TOKEN_KEY = 'auth_token';
 const AUTH_USER_KEY = 'auth_user';
@@ -64,6 +69,7 @@ export default function App() {
     await SecureStore.deleteItemAsync(AUTH_USER_KEY);
     await SecureStore.deleteItemAsync(STORAGE_KEY);
     await SecureStore.deleteItemAsync(TRACKING_ACTIVE_KEY);
+    await SecureStore.deleteItemAsync(TRACKING_TOTAL_DISTANCE_KEY);
     await SecureStore.deleteItemAsync(TRACKING.SESSION_KEY);
   };
 

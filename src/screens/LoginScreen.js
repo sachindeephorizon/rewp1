@@ -61,8 +61,7 @@ export default function LoginScreen({ onAuth }) {
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
         <ScrollView contentContainerStyle={s.scroll} keyboardShouldPersistTaps="handled" showsVerticalScrollIndicator={false}>
           <View style={s.card}>
-            <Text style={s.title}>Deep Horizon</Text>
-            <Text style={s.sub}>{isSignUp ? 'Create your account' : 'Welcome back'}</Text>
+            <Text style={s.title}>{isSignUp ? 'Create your account' : 'Welcome back'}</Text>
 
             {/* TABS */}
             <View style={s.tabs}>

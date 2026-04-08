@@ -1,8 +1,9 @@
-export const BACKEND_URL = 'http://192.168.0.187:9001';
+export const BACKEND_URL = 'https://rewp2-production.up.railway.app';
 export const BACKGROUND_TASK = 'background-location-task';
 export const STORAGE_KEY = 'activeUserId';
 export const TRACKING_ACTIVE_KEY = 'tracking_active';
 export const APP_STATE_KEY = 'tracking_app_state';
+export const TRACKING_TOTAL_DISTANCE_KEY = 'tracking_total_distance_m';
 
 export const GPS = {
   MAX_ACCURACY: 35,

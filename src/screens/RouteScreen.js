@@ -207,6 +207,21 @@ export default function RouteScreen({ origin, initialDestination, onClose, onCon
     applyDestination({ lat, lng, name: `${lat.toFixed(4)}, ${lng.toFixed(4)}` });
   };
 
+  const handleMapPick = (point) => {
+    const picked = {
+      lat: point.lat,
+      lng: point.lng,
+      name: `Pinned destination (${point.lat.toFixed(5)}, ${point.lng.toFixed(5)})`,
+    };
+    suppressNextSearchRef.current = true;
+    setNameInput(picked.name);
+    setLatInput(point.lat.toFixed(6));
+    setLngInput(point.lng.toFixed(6));
+    setSuggestions([]);
+    setShowSuggestions(false);
+    applyDestination(picked);
+  };
+
   const handleClear = () => {
     setDestination(null);
     setRoute(null);
@@ -318,7 +333,12 @@ export default function RouteScreen({ origin, initialDestination, onClose, onCon
       </View>
 
       <View style={s.mapWrap}>
-        <RouteMap origin={origin} destination={destination} route={route} />
+        <RouteMap
+          origin={origin}
+          destination={destination}
+          route={route}
+          onMapPress={handleMapPick}
+        />
       </View>
 
       <View style={s.footer}>
@@ -334,7 +354,9 @@ export default function RouteScreen({ origin, initialDestination, onClose, onCon
             </Text>
           ) : loading ? (
             <Text style={s.footerMeta}>Computing route…</Text>
-          ) : null}
+          ) : (
+            <Text style={s.footerMeta}>Tap anywhere on the map to pin a destination</Text>
+          )}
         </View>
         {destination ? (
           <Pressable style={s.clearBtn} onPress={handleClear}>

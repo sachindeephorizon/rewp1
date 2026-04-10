@@ -1,6 +1,6 @@
 {
   "expo": {
-    "owner": "sachin2810",
+    "owner": "v.sachin",
     "name": "location_service",
     "slug": "location_service",
     "version": "1.0.0",
@@ -54,7 +54,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "47486d88-5630-4a77-8b2f-1e5a007d093a"
+        "projectId": "e83d814d-c2ab-4628-b65c-dc1cae4fd8b4"
       }
     }
   }

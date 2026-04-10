@@ -30,7 +30,7 @@ import {
 } from '../config/constants';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
-import { sendPing, sendStop } from '../api/location';
+import { fetchSessionDistance, sendPing, sendStop } from '../api/location';
 import { resetBackgroundState } from '../tasks/backgroundLocation';
 import {
   buildTrackingPayload,
@@ -132,6 +132,16 @@ export default function TrackingScreen({ user, onLogout }) {
     } catch {}
   }, []);
 
+  const reconcileDistanceFromBackend = useCallback(async () => {
+    const backendDistance = await fetchSessionDistance(userId);
+    if (!Number.isFinite(backendDistance) || backendDistance < 0) return null;
+
+    distRef.current = backendDistance;
+    setTotalDist(backendDistance);
+    await persistDistance(backendDistance);
+    return backendDistance;
+  }, [persistDistance, userId]);
+
   // Persist destination + route so navigation state survives a process kill.
   // Reading them back happens in the bootstrap effect below.
   const persistNavState = useCallback(async (dest, routeArr) => {
@@ -175,6 +185,7 @@ export default function TrackingScreen({ user, onLogout }) {
         const trackingActive = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
         if (trackingActive === 'true') {
           await loadPersistedDistance();
+          await reconcileDistanceFromBackend();
         }
 
         if (gapMs > GPS.MAX_GAP_MS) {
@@ -196,7 +207,7 @@ export default function TrackingScreen({ user, onLogout }) {
     syncAppState(AppState.currentState);
     const subscription = AppState.addEventListener('change', syncAppState);
     return () => subscription.remove();
-  }, [addLog, loadPersistedDistance]);
+  }, [addLog, loadPersistedDistance, reconcileDistanceFromBackend]);
 
   const updateMap = useCallback((lat, lng, accuracy, nextTrail) => {
     mapRef.current?.postMessage(JSON.stringify({
@@ -315,6 +326,7 @@ export default function TrackingScreen({ user, onLogout }) {
     await SecureStore.setItemAsync(TRACKING.SESSION_KEY, activeSessionId);
     if (isResume) {
       await loadPersistedDistance();
+      await reconcileDistanceFromBackend();
     } else {
       distRef.current = 0;
       setTotalDist(0);
@@ -470,7 +482,7 @@ export default function TrackingScreen({ user, onLogout }) {
         addLog('error', `Background task failed: ${err.message}`);
       }
     }
-  }, [addLog, loadPersistedDistance, persistDistance, pushTrailPoint, runPingLoop, userId]);
+  }, [addLog, loadPersistedDistance, persistDistance, pushTrailPoint, reconcileDistanceFromBackend, runPingLoop, userId]);
 
   const stopNativeTracking = useCallback(async () => {
     pingLoopActiveRef.current = false;

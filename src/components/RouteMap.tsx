@@ -16,6 +16,7 @@ interface RouteMapProps {
    * draw a straight blue line between origin and destination as a placeholder.
    */
   route?: LatLng[];
+  onMapPress?: (point: LatLng) => void;
 }
 
 const buildRouteHTML = (
@@ -60,11 +61,12 @@ var endIcon=L.divIcon({className:'',html:'<div class="gm-pin"></div>',iconSize:[
 L.marker(origin,{icon:startIcon}).addTo(map);
 
 var routeLine=null;
+var destMarker=null;
 if(routePts.length>1){
   routeLine=L.polyline(routePts,{color:'#2563EB',weight:5,opacity:0.85,lineCap:'round',lineJoin:'round'}).addTo(map);
 }
 if(dest){
-  L.marker(dest,{icon:endIcon}).addTo(map);
+  destMarker=L.marker(dest,{icon:endIcon}).addTo(map);
 }
 
 if(routeLine){
@@ -72,10 +74,24 @@ if(routeLine){
 }else if(dest){
   map.fitBounds(L.latLngBounds([origin,dest]),{padding:[40,40]});
 }
+
+function sendToReactNative(payload){
+  if(window.ReactNativeWebView&&window.ReactNativeWebView.postMessage){
+    window.ReactNativeWebView.postMessage(JSON.stringify(payload));
+  }
+}
+
+map.on('click',function(e){
+  var lat=e.latlng.lat;
+  var lng=e.latlng.lng;
+  if(destMarker){ map.removeLayer(destMarker); }
+  destMarker=L.marker([lat,lng],{icon:endIcon}).addTo(map);
+  sendToReactNative({ t:'pick', lat:lat, lng:lng });
+});
 <\/script></body></html>`;
 };
 
-const RouteMap = forwardRef<WebView, RouteMapProps>(({ origin, destination, route }, ref) => {
+const RouteMap = forwardRef<WebView, RouteMapProps>(({ origin, destination, route, onMapPress }, ref) => {
   // Re-render the WebView whenever any of these change by keying source via memo
   const html = useMemo(
     () => buildRouteHTML(origin, destination, route),
@@ -90,6 +106,14 @@ const RouteMap = forwardRef<WebView, RouteMapProps>(({ origin, destination, rout
         style={{ flex: 1 }}
         javaScriptEnabled
         originWhitelist={['*']}
+        onMessage={(event) => {
+          try {
+            const data = JSON.parse(event.nativeEvent.data);
+            if (data?.t === 'pick' && Number.isFinite(data.lat) && Number.isFinite(data.lng)) {
+              onMapPress?.({ lat: data.lat, lng: data.lng });
+            }
+          } catch {}
+        }}
       />
     </View>
   );

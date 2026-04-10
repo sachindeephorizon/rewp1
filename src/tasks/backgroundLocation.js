@@ -35,41 +35,45 @@ TaskManager.defineTask(BACKGROUND_TASK, async ({ data, error }) => {
     const trackingActive = await SecureStore.getItemAsync(TRACKING_ACTIVE_KEY);
     const appState = await SecureStore.getItemAsync(APP_STATE_KEY);
     const sessionId = await SecureStore.getItemAsync(TRACKING.SESSION_KEY);
-    const loc = data.locations?.[0];
+    const locations = Array.isArray(data.locations)
+      ? [...data.locations].sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+      : [];
 
-    if (trackingActive !== 'true' || !userId || !loc) return;
+    if (trackingActive !== 'true' || !userId || locations.length === 0) return;
 
-    const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
-    if (!result) return;
+    for (const loc of locations) {
+      const result = processLocation(loc, bgPrev, bgKalman, false, bgWindow);
+      if (!result) continue;
 
-    bgPrev = {
-      latitude: result.latitude,
-      longitude: result.longitude,
-      timestamp: result.timestamp,
-    };
+      bgPrev = {
+        latitude: result.latitude,
+        longitude: result.longitude,
+        timestamp: result.timestamp,
+      };
 
-    bgSequence += 1;
+      bgSequence += 1;
 
-    if (result.moving && result.distance > 0) {
-      const currentDistanceRaw = await SecureStore.getItemAsync(TRACKING_TOTAL_DISTANCE_KEY);
-      const currentDistance = currentDistanceRaw ? Number(currentDistanceRaw) : 0;
-      const safeCurrentDistance =
-        Number.isFinite(currentDistance) && currentDistance >= 0 ? currentDistance : 0;
-      const nextDistance = safeCurrentDistance + result.distance;
-      await SecureStore.setItemAsync(TRACKING_TOTAL_DISTANCE_KEY, String(nextDistance));
+      if (result.moving && result.distance > 0) {
+        const currentDistanceRaw = await SecureStore.getItemAsync(TRACKING_TOTAL_DISTANCE_KEY);
+        const currentDistance = currentDistanceRaw ? Number(currentDistanceRaw) : 0;
+        const safeCurrentDistance =
+          Number.isFinite(currentDistance) && currentDistance >= 0 ? currentDistance : 0;
+        const nextDistance = safeCurrentDistance + result.distance;
+        await SecureStore.setItemAsync(TRACKING_TOTAL_DISTANCE_KEY, String(nextDistance));
+      }
+
+      const payload = buildTrackingPayload({
+        userId,
+        result,
+        sessionId,
+        sequence: bgSequence,
+        source: 'background_task',
+        appState: appState || TRACKING.APP_STATE_BACKGROUND,
+        gpsIntervalMs: GPS.GPS_INTERVAL_BACKGROUND,
+      });
+
+      await postLocationUpdate(userId, payload, 8000);
     }
-
-    const payload = buildTrackingPayload({
-      userId,
-      result,
-      sessionId,
-      sequence: bgSequence,
-      source: 'background_task',
-      appState: appState || TRACKING.APP_STATE_BACKGROUND,
-      gpsIntervalMs: GPS.GPS_INTERVAL_BACKGROUND,
-    });
-
-    await postLocationUpdate(userId, payload, 8000);
   } catch (err) {
     console.error('Background sync failed:', err);
   }

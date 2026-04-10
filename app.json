@@ -1,8 +1,8 @@
 {
   "expo": {
-    "owner": "v.sachin",
+    "owner": "deephorizon-security-technologies",
     "name": "location_service",
-    "slug": "location_service",
+    "slug": "location-tracker",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -54,7 +54,7 @@
     ],
     "extra": {
       "eas": {
-        "projectId": "e83d814d-c2ab-4628-b65c-dc1cae4fd8b4"
+        "projectId": "3ed5d72a-b352-4558-af77-666be5da0489"
       }
     }
   }

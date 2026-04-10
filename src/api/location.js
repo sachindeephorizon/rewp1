@@ -71,7 +71,12 @@ export const sendPing = async (userId, payload) => {
   }
 
   const data = await res.json();
-  return { ok: true, status: data.filtered ? 'filtered' : 'synced' };
+  return {
+    ok: true,
+    status: data.filtered ? 'filtered' : 'synced',
+    forceRefresh: !!data.forceRefresh,
+    deviationAlert: data.deviationAlert || null,
+  };
 };
 
 /**
@@ -87,6 +92,67 @@ export const fetchSessionDistance = async (userId) => {
     return data.ok ? data.distance : null;
   } catch {
     return null;
+  }
+};
+
+/**
+ * Set a destination on the backend. Backend computes the OSRM route + H3 corridor.
+ * Returns { ok, distance, duration }.
+ */
+export const setDestination = async (userId, origin, destination, name) => {
+  try {
+    const res = await fetch(`${BACKEND_URL}/destination/${userId}/set`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ origin, destination, name }),
+    });
+    if (!res.ok) return { ok: false };
+    return await res.json();
+  } catch {
+    return { ok: false };
+  }
+};
+
+/**
+ * Clear the destination on the backend.
+ */
+export const clearDestination = async (userId) => {
+  try {
+    await fetch(`${BACKEND_URL}/destination/${userId}/clear`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch {}
+};
+
+/**
+ * Get remaining distance to destination from the backend.
+ * Returns { ok, active, remaining, destination, name }.
+ */
+export const getDestinationRemaining = async (userId) => {
+  try {
+    const res = await fetch(`${BACKEND_URL}/destination/${userId}/remaining`);
+    if (!res.ok) return { ok: false, active: false };
+    return await res.json();
+  } catch {
+    return { ok: false, active: false };
+  }
+};
+
+/**
+ * Check if an agent has requested a forced location update for this user.
+ * Returns { pending: boolean }.
+ */
+export const checkForceRequest = async (userId) => {
+  try {
+    const res = await fetch(`${BACKEND_URL}/user/${userId}/request-location`, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    if (!res.ok) return { pending: false };
+    const data = await res.json();
+    return { pending: !!data.pending };
+  } catch {
+    return { pending: false };
   }
 };
 

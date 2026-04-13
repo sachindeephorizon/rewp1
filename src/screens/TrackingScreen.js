@@ -282,13 +282,26 @@ export default function TrackingScreen({ user, onLogout }) {
             addLog('error', `#${pingNum} UNKNOWN status=${result.status} | appState=${appState}`);
           }
 
+          // Server-side arrival detection
+          if (result.arrivalDetected) {
+            addLog('info', 'Arrived at destination (server-confirmed)');
+            setDestination(null);
+            setRemainingDist(null);
+            setDeviationAlert(null);
+            await persistDest(null);
+          }
+
           // Deviation alert from backend
           if (result.deviationAlert) {
             setDeviationAlert(result.deviationAlert);
             addLog('warn', `DEVIATION: ${result.deviationAlert.distanceFromRoute || '?'}m from route | streak=${result.deviationAlert.consecutive}`);
           } else if (result.status === 'synced') {
-            // Clear deviation when back on route (backend stops sending alerts)
             setDeviationAlert(null);
+          }
+
+          // Inactivity flag
+          if (result.inactivityFlag) {
+            addLog('warn', 'INACTIVITY: stationary >15min — check on user');
           }
 
           // If the backend signals a pending force-location request from an

@@ -76,6 +76,8 @@ export const sendPing = async (userId, payload) => {
     status: data.filtered ? 'filtered' : 'synced',
     forceRefresh: !!data.forceRefresh,
     deviationAlert: data.deviationAlert || null,
+    arrivalDetected: !!data.arrivalDetected,
+    inactivityFlag: !!data.inactivityFlag,
   };
 };
 

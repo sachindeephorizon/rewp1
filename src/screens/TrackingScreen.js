@@ -21,11 +21,13 @@ import {
   APP_STATE_KEY,
   BACKGROUND_TASK,
   GPS,
+  GPS_TIERS,
   NAV_DESTINATION_KEY,
   STORAGE_KEY,
   TRACKING,
   TRACKING_ACTIVE_KEY,
 } from '../config/constants';
+import { TierSignalService, TIERS } from '../services/tierSignal';
 import { KalmanFilter2D } from '../utils/KalmanFilter2D';
 import { processLocation, SlidingWindow } from '../utils/processLocation';
 import { checkForceRequest, clearDestination, getDestinationRemaining, sendPing, sendStop, setDestination as apiSetDestination } from '../api/location';
@@ -57,6 +59,8 @@ export default function TrackingScreen({ user, onLogout }) {
   const [destination, setDestination] = useState(null);   // { lat, lng, name }
   const [remainingDist, setRemainingDist] = useState(null); // metres, from backend
   const [deviationAlert, setDeviationAlert] = useState(null); // { distanceFromRoute, consecutive, detectedAt }
+  const [currentTier, setCurrentTier] = useState(1);
+  const tierServiceRef = useRef(null);
   const [refreshing, setRefreshing] = useState(false);
   const refreshingRef = useRef(false);
   const logScrollRef = useRef(null);
@@ -304,6 +308,19 @@ export default function TrackingScreen({ user, onLogout }) {
             addLog('warn', 'INACTIVITY: stationary >15min — check on user');
           }
 
+          // ── Tier signal: push backend signals into the tier service ──
+          const ts = tierServiceRef.current;
+          if (ts) {
+            if (result.deviationAlert) {
+              // consecutive >= 6 = long deviation, otherwise short
+              const isLong = result.deviationAlert.consecutive >= 6;
+              ts.pushSignal({ type: isLong ? 'long_deviation' : 'short_deviation' });
+            } else if (result.status === 'synced' && !result.deviationAlert) {
+              ts.clearSignal('short_deviation');
+              ts.clearSignal('long_deviation');
+            }
+          }
+
           // If the backend signals a pending force-location request from an
           // agent, trigger an immediate fresh GPS fix + ping.
           if (result.forceRefresh && !forceRefreshingRef.current) {
@@ -359,7 +376,52 @@ export default function TrackingScreen({ user, onLogout }) {
     sequenceRef.current = 0;
     backgroundSinceRef.current = null;
 
-    addLog('info', `Tracking started | session=${activeSessionId}`);
+    // ── Initialize Tier Signal Service ──────────────────────────────
+    if (tierServiceRef.current) tierServiceRef.current.destroy();
+    const tierService = new TierSignalService();
+    tierServiceRef.current = tierService;
+    setCurrentTier(TIERS.TIER_1);
+
+    // When tier changes, restart GPS watcher with new accuracy + interval
+    tierService.onTierChange((newTier, reason, prevTier) => {
+      setCurrentTier(newTier);
+      addLog('info', `TIER ${prevTier} → ${newTier} (${reason}) | ${GPS_TIERS[newTier].label}`);
+
+      if (restartingGpsRef.current) return;
+      restartingGpsRef.current = true;
+
+      const tierConfig = GPS_TIERS[newTier];
+      const accuracyMap = {
+        Balanced: Location.Accuracy.Balanced,
+        High: Location.Accuracy.High,
+        BestForNavigation: Location.Accuracy.BestForNavigation,
+      };
+      const newAccuracy = accuracyMap[tierConfig.accuracy] || Location.Accuracy.Balanced;
+      const newInterval = tierConfig.foregroundInterval;
+      currentGpsIntervalRef.current = newInterval;
+
+      const oldSub = subRef.current;
+      Location.watchPositionAsync(
+        {
+          accuracy: newAccuracy,
+          timeInterval: newInterval,
+          distanceInterval: 0,
+        },
+        onGpsUpdate
+      )
+        .then((newSub) => {
+          subRef.current = newSub;
+          if (oldSub) oldSub.remove();
+          restartingGpsRef.current = false;
+          justRestartedGpsRef.current = true;
+        })
+        .catch((err) => {
+          addLog('error', `Tier GPS switch failed: ${err.message}`);
+          restartingGpsRef.current = false;
+        });
+    });
+
+    addLog('info', `Tracking started | session=${activeSessionId} | Tier 1 (Passive)`);
 
     const onGpsUpdate = (loc) => {
       if (justRestartedGpsRef.current) {
@@ -398,8 +460,19 @@ export default function TrackingScreen({ user, onLogout }) {
         });
       }
 
+      // Feed position to tier service for inactivity detection
+      // (<30m distance covered in 10min + not near destination)
+      if (tierServiceRef.current) {
+        const nearDest = false; // remaining-distance poll will update this
+        tierServiceRef.current.reportPosition(
+          processed.latitude,
+          processed.longitude,
+          nearDest
+        );
+      }
+
       sequenceRef.current += 1;
-      latestPingRef.current = buildTrackingPayload({
+      const pingPayload = buildTrackingPayload({
         userId,
         result: processed,
         sessionId: activeSessionId,
@@ -411,6 +484,10 @@ export default function TrackingScreen({ user, onLogout }) {
             : TRACKING.APP_STATE_BACKGROUND,
         gpsIntervalMs: currentGpsIntervalRef.current,
       });
+      // Attach current GPS tier to the payload
+      pingPayload.tier = tierServiceRef.current?.currentTier || 1;
+      pingPayload.tierReason = tierServiceRef.current?.currentReason || 'default';
+      latestPingRef.current = pingPayload;
 
       if (processed.moving) {
         stationaryCountRef.current = 0;
@@ -453,17 +530,19 @@ export default function TrackingScreen({ user, onLogout }) {
       }
     };
 
-    currentGpsIntervalRef.current = GPS.GPS_INTERVAL_MOVING;
+    // Start at Tier 1: passive, cell tower / WiFi, minimal battery
+    const startTier = GPS_TIERS[TIERS.TIER_1];
+    currentGpsIntervalRef.current = startTier.foregroundInterval;
     const sub = await Location.watchPositionAsync(
       {
-        accuracy: Location.Accuracy.BestForNavigation,
-        timeInterval: GPS.GPS_INTERVAL_MOVING,
+        accuracy: Location.Accuracy.Balanced, // Tier 1: cell+WiFi
+        timeInterval: startTier.foregroundInterval,
         distanceInterval: 0,
       },
       onGpsUpdate
     );
     subRef.current = sub;
-    addLog('info', 'GPS watcher started');
+    addLog('info', `GPS watcher started | Tier 1 (${startTier.label}) @ ${startTier.foregroundInterval}ms`);
 
     latestPingRef.current = null;
     runPingLoop(userId);
@@ -497,6 +576,13 @@ export default function TrackingScreen({ user, onLogout }) {
     restartingGpsRef.current = false;
     sequenceRef.current = 0;
     backgroundSinceRef.current = null;
+
+    // Destroy tier service
+    if (tierServiceRef.current) {
+      tierServiceRef.current.destroy();
+      tierServiceRef.current = null;
+    }
+    setCurrentTier(1);
 
     if (subRef.current) {
       subRef.current.remove();
@@ -794,6 +880,12 @@ export default function TrackingScreen({ user, onLogout }) {
           <Text style={s.statVal}>{accDisplay}</Text>
           <Text style={s.statLbl}>Accuracy</Text>
         </View>
+        <View style={[s.statCard, currentTier === 3 && s.statCardAlert]}>
+          <Text style={[s.statVal, currentTier === 3 && { color: '#DC2626' }]}>
+            {GPS_TIERS[currentTier]?.label || 'Tier ' + currentTier}
+          </Text>
+          <Text style={s.statLbl}>GPS Mode</Text>
+        </View>
       </View>
 
       <MiniMap
@@ -971,6 +1063,7 @@ const s = StyleSheet.create({
   badgeTextOff: { color: '#EF4444' },
   statsRow: { flexDirection: 'row', gap: 8, marginBottom: 10 },
   statCard: { flex: 1, backgroundColor: '#FFF', borderRadius: 10, padding: 10, alignItems: 'center', shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 2 },
+  statCardAlert: { backgroundColor: '#FEF2F2', borderWidth: 1, borderColor: '#FECACA' },
   statVal: { fontSize: 13, fontWeight: '700', color: '#1E293B', marginBottom: 2 },
   statLbl: { fontSize: 9, color: '#94A3B8', textTransform: 'uppercase', fontWeight: '600', letterSpacing: 0.5 },
   infoCard: { backgroundColor: '#FFF', borderRadius: 10, padding: 12, marginBottom: 8, shadowColor: '#000', shadowOffset: { width: 0, height: 1 }, shadowOpacity: 0.05, shadowRadius: 3, elevation: 2 },

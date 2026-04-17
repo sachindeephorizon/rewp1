@@ -22,6 +22,31 @@ export const GPS = {
   GPS_INTERVAL_BACKGROUND: 10000,
 };
 
+// Three-tier GPS model (PDF Section 5)
+// Tier 1: Passive — cell tower / WiFi. Minimal battery (~1-2%/hr)
+// Tier 2: Active GPS balanced. Moderate battery (~4-6%/hr)
+// Tier 3: Full GPS max accuracy. High battery (~10-15%/hr) — emergency only
+export const GPS_TIERS = {
+  1: {
+    accuracy: 'Balanced',            // Expo: Location.Accuracy.Balanced (cell+WiFi)
+    foregroundInterval: 30000,        // 30s — passive, just checking in
+    backgroundInterval: 60000,        // 60s
+    label: 'Passive',
+  },
+  2: {
+    accuracy: 'High',                // Expo: Location.Accuracy.High (GPS, battery-aware)
+    foregroundInterval: 15000,        // 15s — active monitoring
+    backgroundInterval: 20000,        // 20s
+    label: 'Active GPS',
+  },
+  3: {
+    accuracy: 'BestForNavigation',   // Expo: Location.Accuracy.BestForNavigation (max GPS)
+    foregroundInterval: 5000,         // 5s — emergency, full power
+    backgroundInterval: 5000,         // 5s
+    label: 'Emergency GPS',
+  },
+};
+
 export const TRACKING = {
   APP_STATE_FOREGROUND: 'foreground',
   APP_STATE_BACKGROUND: 'background',
